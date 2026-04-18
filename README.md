@@ -92,6 +92,20 @@ aube lint
 
 If the script exists in `package.json`, aube treats that as `aube run <script>`.
 
+### Shortcuts: `aubr` and `aubx`
+
+`aubr` and `aubx` are multicall shims for `aube run` and `aube dlx`. They
+share a binary with `aube` and dispatch purely on `argv[0]`, so every flag
+that works on the full command also works on the shim:
+
+```sh
+aubr build            # aube run build
+aubx cowsay hi        # aube dlx cowsay hi
+```
+
+The release archives ship all three binaries side by side; no extra
+setup is needed when you install aube via mise or the tarball.
+
 ## CI
 
 Use `aube ci` when the lockfile must be treated as the source of truth:
