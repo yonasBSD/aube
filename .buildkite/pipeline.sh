@@ -61,7 +61,16 @@ steps:
         commands:
           - "export AUBE_BOOTSTRAP_MSRV=1; source .buildkite/bootstrap.sh"
           - "mise run test"
-          - "mise run lint"
+          # Pipe through cat to break the PTY Buildkite allocates — without it
+          # hk thinks stderr is interactive and emits ~10k spinner-frame lines
+          # that Buildkite captures as log rows after stripping the cursor
+          # escapes. Kept at the pipeline layer (not in mise.toml) so local
+          # runs of mise run lint keep their animated UI. set -o pipefail is
+          # scoped to this command because Buildkite runs each commands:
+          # list entry in its own shell — the pipefail from bootstrap.sh
+          # does not carry over, and without it cat's zero exit would mask
+          # a failing hk check.
+          - "set -o pipefail; mise run lint 2>&1 | cat"
           - "mise run render"
           - "mise run docs:build"
 
