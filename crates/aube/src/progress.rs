@@ -298,23 +298,42 @@ impl InstallProgress {
     }
 
     /// Finalize and clear the progress display. TTY mode leaves no output
-    /// behind. CI mode prints a final status line + `Done in Xs` summary
-    /// and blocks until the heartbeat thread has actually stopped, so no
-    /// stray tick can appear after the summary. Idempotent.
-    pub fn finish(&self) {
+    /// behind. CI mode blocks until the heartbeat thread has actually
+    /// stopped so no stray tick can appear after this returns, and
+    /// optionally writes the final framed `[ ✓ … ]` status line.
+    /// Idempotent.
+    ///
+    /// `print_ci_summary`: set to `false` when a later call site will
+    /// print its own end-of-install line (so the main install path
+    /// doesn't double up with [`print_install_summary`]). Set to `true`
+    /// for early-return paths (`--lockfile-only`, drift check) that
+    /// want the framed summary to remain the end of CI log output.
+    pub fn finish(&self, print_ci_summary: bool) {
         match &self.mode {
             Mode::Tty { root, .. } => {
                 root.set_status(ProgressStatus::Done);
                 clx::progress::stop_clear();
             }
-            Mode::Ci(s) => s.stop(true),
+            Mode::Ci(s) => s.stop(print_ci_summary),
         }
     }
 
-    /// Emit the post-install summary line ("installed N packages in Xs",
-    /// in green) after the progress display has been torn down. TTY-only:
-    /// CI mode already prints a framed `✓` summary from the heartbeat's
-    /// final tick, and doubling it up would just be noise.
+    /// Emit the post-install summary line after the progress display has
+    /// been torn down. Two shapes:
+    ///
+    /// * `linked > 0` — `aube VERSION by en.dev · ✓ installed N packages
+    ///   in Xs`, TTY-only (CI mode prints its own framed `✓` summary
+    ///   from the heartbeat's final tick).
+    /// * `linked == 0 && top_level_linked == 0` — `Already up to date`
+    ///   (matches pnpm), printed in both TTY and CI modes so cache-only
+    ///   runs confirm nothing needed doing. Stays silent in reporter
+    ///   modes where `prog_ref` is `None`.
+    ///
+    /// The `top_level_linked` guard distinguishes a true no-op from the
+    /// `rm -rf node_modules && aube install` case where the global store
+    /// was warm (so `packages_linked` is 0) but every top-level symlink
+    /// had to be recreated — that's not "up to date" from the user's
+    /// perspective.
     ///
     /// **Safety:** must be called *after* [`InstallProgress::finish`]. The
     /// write goes straight to stderr without routing through
@@ -322,12 +341,39 @@ impl InstallProgress {
     /// `finish()` has synchronously stopped the render loop via
     /// `stop_clear()`. A new call site placed before `finish()` would
     /// silently race the animated display.
-    ///
-    /// A `linked` count of zero means no new packages were materialized
-    /// (cache-only run, or `--lockfile-only` short-circuit), so we stay
-    /// silent — matches how pnpm suppresses the "added" line when it's
-    /// zero.
-    pub fn print_tty_summary(&self, linked: usize, elapsed: Duration) {
+    pub fn print_install_summary(
+        &self,
+        linked: usize,
+        top_level_linked: usize,
+        total_packages: usize,
+        elapsed: Duration,
+    ) {
+        if linked == 0 && top_level_linked == 0 {
+            let word = if total_packages == 1 {
+                "package"
+            } else {
+                "packages"
+            };
+            let msg = if total_packages == 0 {
+                "Already up to date".to_string()
+            } else {
+                format!("Already up to date ({total_packages} {word})")
+            };
+            // Same `aube VERSION by en.dev · …` shape in both TTY and
+            // CI modes so the no-op line reads as part of the install
+            // UI family. `style::e*` respects `NO_COLOR` / `--no-color`,
+            // so CI environments that strip styling get plain text.
+            let line = format!(
+                "{} {} {} {} {}",
+                style::emagenta("aube").bold(),
+                style::edim(env!("CARGO_PKG_VERSION")),
+                style::edim("by en.dev"),
+                style::edim("·"),
+                style::egreen(msg).bold(),
+            );
+            let _ = writeln!(std::io::stderr(), "{line}");
+            return;
+        }
         if linked == 0 {
             return;
         }
@@ -587,15 +633,17 @@ impl CiState {
         render_bar_with_label(completed, resolved, term_width(), &label)
     }
 
-    /// Colored, framed header line. Emitted once, on the first heartbeat
-    /// tick where there's something to show — so the CI log only grows
-    /// an aube banner when an install is actually happening.
+    /// Framed header line. Emitted once, on the first heartbeat tick
+    /// where there's something to show — so the CI log only grows an
+    /// aube banner when an install is actually happening. Styling
+    /// routes through `style::e*`, so `NO_COLOR` / `--no-color` drops
+    /// the ANSI escapes automatically.
     fn render_header() -> String {
         let header_text = format!(
             "{} {} {}",
-            forced(console::style("aube").magenta().bold()),
-            forced(console::style(env!("CARGO_PKG_VERSION")).dim()),
-            forced(console::style("by en.dev").dim()),
+            style::emagenta("aube").bold(),
+            style::edim(env!("CARGO_PKG_VERSION")),
+            style::edim("by en.dev"),
         );
         render_centered_line(&header_text, term_width())
     }
@@ -711,8 +759,8 @@ impl CiState {
         let elapsed = self.start.elapsed();
         let summary = format!(
             "{} {} · resolved {} · reused {} · downloaded {} ({})",
-            forced(console::style("✓").green().bright()),
-            forced(console::style(format_duration(elapsed)).dim()),
+            style::egreen("✓"),
+            style::edim(format_duration(elapsed)),
             resolved,
             reused,
             downloaded,
@@ -739,15 +787,6 @@ fn format_duration(d: Duration) -> String {
         let total = d.as_secs();
         format!("{}m{:02}s", total / 60, total % 60)
     }
-}
-
-/// Force-enable ANSI styling on a `console::StyledObject` regardless
-/// of TTY detection. clx/console both strip colors by default when
-/// stderr isn't a terminal, but GitHub Actions (the primary target
-/// for CI mode) renders ANSI just fine, and we want the framed
-/// status block to look the same in CI as it does interactively.
-fn forced<D>(s: console::StyledObject<D>) -> console::StyledObject<D> {
-    s.force_styling(true)
 }
 
 /// Render a plain-text line centered inside the same `[ ]` bracket
