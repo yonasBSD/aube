@@ -23,6 +23,20 @@ cargo install aube --locked
 same dependency versions CI built against. The compiled binary lands in
 `~/.cargo/bin/aube`.
 
+## From npm
+
+aube is also published on npm as `@endevco/aube`:
+
+```sh
+npm install -g @endevco/aube
+# or
+npx @endevco/aube --version
+```
+
+Because the install happens via `preinstall`, this does not work with
+`--ignore-scripts` or in offline/air-gapped caches. Prefer mise or
+`cargo install` for those environments.
+
 ## From source
 
 If you want to build the current checkout yourself, use the standard source
