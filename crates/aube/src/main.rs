@@ -169,11 +169,9 @@ pub(crate) struct Cli {
 
     /// Override the default registry URL for this invocation.
     ///
-    /// Mirrors pnpm's top-level `--registry=<url>`. Must appear before
-    /// the subcommand, e.g. `aube --registry=https://… install`;
-    /// commands that already expose a subcommand-level `--registry`
-    /// (publish, login, view, …) still win for their own traffic.
-    #[arg(long, value_name = "URL")]
+    /// Use this npm registry URL for package metadata, tarballs,
+    /// audit requests, dist-tags, and registry writes.
+    #[arg(long, global = true, value_name = "URL")]
     registry: Option<String>,
 
     /// Output format: default, append-only, ndjson, silent.
@@ -644,7 +642,7 @@ async fn async_main(cli: Cli) -> miette::Result<Option<i32>> {
             post_add_update_notify().await;
         }
         Some(Commands::ApproveBuilds(args)) => commands::approve_builds::run(args).await?,
-        Some(Commands::Audit(args)) => commands::audit::run(args).await?,
+        Some(Commands::Audit(args)) => commands::audit::run(args, cli.registry.as_deref()).await?,
         Some(Commands::Bin(args)) => commands::bin::run(args).await?,
         Some(Commands::Cache(args)) => commands::cache::run(args).await?,
         Some(Commands::CatFile(args)) => commands::cat_file::run(args).await?,
@@ -658,7 +656,9 @@ async fn async_main(cli: Cli) -> miette::Result<Option<i32>> {
         Some(Commands::Deploy(args)) => {
             commands::deploy::run(args, effective_filter.clone()).await?
         }
-        Some(Commands::Deprecate(args)) => commands::deprecate::run(args).await?,
+        Some(Commands::Deprecate(args)) => {
+            commands::deprecate::run(args, cli.registry.as_deref()).await?
+        }
         Some(Commands::DistTag(args)) => commands::dist_tag::run(args).await?,
         Some(Commands::Dlx(args)) => commands::dlx::run(args).await?,
         Some(Commands::Exec(args)) => commands::exec::run(args, effective_filter.clone()).await?,
@@ -686,13 +686,19 @@ async fn async_main(cli: Cli) -> miette::Result<Option<i32>> {
         Some(Commands::Licenses(args)) => commands::licenses::run(args).await?,
         Some(Commands::Link(args)) => commands::link::run(args).await?,
         Some(Commands::List(args)) => commands::list::run(args, effective_filter.clone()).await?,
-        Some(Commands::Login(args)) => commands::login::run(args).await?,
-        Some(Commands::Logout(args)) => commands::logout::run(args).await?,
+        Some(Commands::Login(args)) => commands::login::run(args, cli.registry.as_deref()).await?,
+        Some(Commands::Logout(args)) => {
+            commands::logout::run(args, cli.registry.as_deref()).await?
+        }
         Some(Commands::Outdated(args)) => {
             commands::outdated::run(args, effective_filter.clone()).await?
         }
         Some(Commands::Owner(args)) => {
-            return Ok(Some(commands::npm_fallback::run("owner", &args.args)?));
+            return Ok(Some(commands::npm_fallback::run(
+                "owner",
+                &args.args,
+                cli.registry.as_deref(),
+            )?));
         }
         Some(Commands::Pack(args)) => commands::pack::run(args).await?,
         Some(Commands::Patch(args)) => commands::patch::run(args).await?,
@@ -700,11 +706,15 @@ async fn async_main(cli: Cli) -> miette::Result<Option<i32>> {
         Some(Commands::PatchRemove(args)) => commands::patch_remove::run(args).await?,
         Some(Commands::Peers(args)) => commands::peers::run(args).await?,
         Some(Commands::Pkg(args)) => {
-            return Ok(Some(commands::npm_fallback::run("pkg", &args.args)?));
+            return Ok(Some(commands::npm_fallback::run(
+                "pkg",
+                &args.args,
+                cli.registry.as_deref(),
+            )?));
         }
         Some(Commands::Prune(args)) => commands::prune::run(args).await?,
         Some(Commands::Publish(args)) => {
-            commands::publish::run(args, effective_filter.clone()).await?
+            commands::publish::run(args, effective_filter.clone(), cli.registry.as_deref()).await?
         }
         Some(Commands::Purge(args)) => commands::clean::run_purge(args).await?,
         Some(Commands::Rebuild(args)) => {
@@ -753,7 +763,7 @@ async fn async_main(cli: Cli) -> miette::Result<Option<i32>> {
                     commands::outdated::run(args, nested_filter).await?
                 }
                 Some(Commands::Publish(args)) => {
-                    commands::publish::run(args, nested_filter).await?
+                    commands::publish::run(args, nested_filter, nested.registry.as_deref()).await?
                 }
                 Some(Commands::Rebuild(args)) => {
                     commands::rebuild::run(args, nested_filter).await?
@@ -818,11 +828,19 @@ async fn async_main(cli: Cli) -> miette::Result<Option<i32>> {
         Some(Commands::Run(args)) => commands::run::run(args, effective_filter.clone()).await?,
         Some(Commands::Sbom(args)) => commands::sbom::run(args).await?,
         Some(Commands::Search(args)) => {
-            return Ok(Some(commands::npm_fallback::run("search", &args.args)?));
+            return Ok(Some(commands::npm_fallback::run(
+                "search",
+                &args.args,
+                cli.registry.as_deref(),
+            )?));
         }
         Some(Commands::Set(args)) => commands::config::set(args)?,
         Some(Commands::SetScript(args)) => {
-            return Ok(Some(commands::npm_fallback::run("set-script", &args.args)?));
+            return Ok(Some(commands::npm_fallback::run(
+                "set-script",
+                &args.args,
+                cli.registry.as_deref(),
+            )?));
         }
         Some(Commands::Start(args)) => {
             commands::run::run_script(
@@ -856,11 +874,19 @@ async fn async_main(cli: Cli) -> miette::Result<Option<i32>> {
             .await?;
         }
         Some(Commands::Token(args)) => {
-            return Ok(Some(commands::npm_fallback::run("token", &args.args)?));
+            return Ok(Some(commands::npm_fallback::run(
+                "token",
+                &args.args,
+                cli.registry.as_deref(),
+            )?));
         }
-        Some(Commands::Undeprecate(args)) => commands::undeprecate::run(args).await?,
+        Some(Commands::Undeprecate(args)) => {
+            commands::undeprecate::run(args, cli.registry.as_deref()).await?
+        }
         Some(Commands::Unlink(args)) => commands::unlink::run(args).await?,
-        Some(Commands::Unpublish(args)) => commands::unpublish::run(args).await?,
+        Some(Commands::Unpublish(args)) => {
+            commands::unpublish::run(args, cli.registry.as_deref()).await?
+        }
         Some(Commands::Update(args)) => {
             commands::update::run(args, effective_filter.clone()).await?;
             post_add_update_notify().await;
@@ -868,7 +894,11 @@ async fn async_main(cli: Cli) -> miette::Result<Option<i32>> {
         Some(Commands::Version(args)) => commands::version::run(args).await?,
         Some(Commands::View(args)) => commands::view::run(args).await?,
         Some(Commands::Whoami(args)) => {
-            return Ok(Some(commands::npm_fallback::run("whoami", &args.args)?));
+            return Ok(Some(commands::npm_fallback::run(
+                "whoami",
+                &args.args,
+                cli.registry.as_deref(),
+            )?));
         }
         Some(Commands::Why(args)) => commands::why::run(args, effective_filter.clone()).await?,
         Some(Commands::Usage) => {
@@ -1354,6 +1384,23 @@ mod cli_spec_tests {
                  Regenerate with: cargo build && ./target/debug/aube usage > aube.usage.kdl"
             );
         }
+    }
+
+    #[test]
+    fn install_accepts_subcommand_registry_flag() {
+        let cli = Cli::try_parse_from([
+            "aube",
+            "install",
+            "--registry",
+            "https://registry.example.com/",
+        ])
+        .expect("install --registry should parse");
+
+        assert_eq!(
+            cli.registry.as_deref(),
+            Some("https://registry.example.com/")
+        );
+        assert!(matches!(cli.command, Some(Commands::Install(_))));
     }
 }
 

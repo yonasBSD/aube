@@ -116,6 +116,12 @@ Use the lockfile when fresh, re-resolve when stale.
 
 Global counterpart to the same `install` flag.
 
+### `--registry <URL>`
+
+Override the default registry URL for this invocation.
+
+Use this npm registry URL for package metadata, tarballs, audit requests, dist-tags, and registry writes.
+
 ### `--reporter <NAME>`
 
 Output format: default, append-only, ndjson, silent.
@@ -161,14 +167,6 @@ Automatically answer yes to prompts.
 
 Parsed for pnpm compatibility; aube does not currently prompt on these paths.
 
-## Flags
-
-### `--registry <URL>`
-
-Override the default registry URL for this invocation.
-
-Mirrors pnpm's top-level `--registry=<url>`. Must appear before the subcommand, e.g. `aube --registry=https://… install`; commands that already expose a subcommand-level `--registry` (publish, login, view, …) still win for their own traffic.
-
 ## Subcommands
 
 - [`aube add [FLAGS] [PACKAGES]…`](/cli/add.md)
@@ -193,7 +191,7 @@ Mirrors pnpm's top-level `--registry=<url>`. Must appear before the subcommand, 
 - [`aube create [PARAMS]…`](/cli/create.md)
 - [`aube dedupe [--check]`](/cli/dedupe.md)
 - [`aube deploy [FLAGS] <TARGET>`](/cli/deploy.md)
-- [`aube deprecate [FLAGS] <PACKAGE> <MESSAGE>`](/cli/deprecate.md)
+- [`aube deprecate [--dry-run] [--otp <CODE>] <PACKAGE> <MESSAGE>`](/cli/deprecate.md)
 - [`aube dist-tag <SUBCOMMAND>`](/cli/dist-tag.md)
 - [`aube dist-tag add <SPEC> [TAG]`](/cli/dist-tag/add.md)
 - [`aube dist-tag ls [PACKAGE]`](/cli/dist-tag/ls.md)
@@ -209,8 +207,8 @@ Mirrors pnpm's top-level `--registry=<url>`. Must appear before the subcommand, 
 - [`aube licenses [FLAGS]`](/cli/licenses.md)
 - [`aube link [-g --global] [PACKAGE]`](/cli/link.md)
 - [`aube list [FLAGS] [PATTERN]`](/cli/list.md)
-- [`aube login [FLAGS]`](/cli/login.md)
-- [`aube logout [--registry <URL>] [--scope <SCOPE>]`](/cli/logout.md)
+- [`aube login [--auth-type <TYPE>] [--scope <SCOPE>]`](/cli/login.md)
+- [`aube logout [--scope <SCOPE>]`](/cli/logout.md)
 - [`aube outdated [FLAGS] [PATTERN]`](/cli/outdated.md)
 - [`aube pack [FLAGS]`](/cli/pack.md)
 - [`aube patch [--edit-dir <DIR>] [--ignore-existing] <PACKAGE>`](/cli/patch.md)
@@ -236,7 +234,7 @@ Mirrors pnpm's top-level `--registry=<url>`. Must appear before the subcommand, 
 - [`aube store prune`](/cli/store/prune.md)
 - [`aube store status`](/cli/store/status.md)
 - [`aube test [--no-install] [ARGS]…`](/cli/test.md)
-- [`aube undeprecate [FLAGS] <PACKAGE>`](/cli/undeprecate.md)
+- [`aube undeprecate [--dry-run] [--otp <CODE>] <PACKAGE>`](/cli/undeprecate.md)
 - [`aube unlink [-g --global] [PACKAGE]`](/cli/unlink.md)
 - [`aube unpublish [FLAGS] [SPEC]`](/cli/unpublish.md)
 - [`aube update [FLAGS] [PACKAGES]…`](/cli/update.md)
