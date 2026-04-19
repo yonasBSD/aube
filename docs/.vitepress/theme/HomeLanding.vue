@@ -47,7 +47,7 @@ const benchmarkRange = (tool: "bun" | "pnpm") => {
   if (!multiples.length) return "";
   const low = Math.max(1, Math.round(Math.min(...multiples)));
   const high = Math.max(low, Math.round(Math.max(...multiples)));
-  return `${low}-${high}`;
+  return low === 1 ? `up to ${high}` : `about ${low}-${high}`;
 };
 const pnpmCiWarmMultiple = benchmarkMultiple("pnpm");
 const bunCiWarmMultiple = benchmarkMultiple("bun");
@@ -240,11 +240,21 @@ watch(progressBarEl, (el, previousEl) => {
           </div>
         </div>
         <dl class="aube-stats">
-          <div>
+          <div class="aube-stat-linked">
+            <a
+              class="aube-stat-link"
+              href="/benchmarks"
+              :aria-label="`See benchmarks — aube is ${pnpmCiWarmMultiple}x faster than pnpm`"
+            ></a>
             <dt>{{ pnpmCiWarmMultiple }}x</dt>
-            <dd>faster than pnpm on warm CI</dd>
+            <dd>faster than pnpm</dd>
           </div>
-          <div>
+          <div class="aube-stat-linked">
+            <a
+              class="aube-stat-link"
+              href="/benchmarks"
+              :aria-label="`See benchmarks — aube is ${bunCiWarmMultiple}x faster than bun`"
+            ></a>
             <dt>{{ bunCiWarmMultiple }}x</dt>
             <dd>faster than bun</dd>
           </div>
@@ -341,10 +351,8 @@ watch(progressBarEl, (el, previousEl) => {
         </span>
         <strong>Fastest Node.js package manager.</strong>
         <span>
-          Warm CI is {{ pnpmCiWarmMultiple }}x faster than pnpm and
-          {{ bunCiWarmMultiple }}x faster than Bun. Across the fixtures, it is
-          about {{ pnpmBenchmarkRange }}x faster than pnpm and
-          {{ bunBenchmarkRange }}x faster than Bun.
+          Across the benchmarks, aube is {{ pnpmBenchmarkRange }}x faster than
+          pnpm and {{ bunBenchmarkRange }}x faster than Bun.
         </span>
         <span class="aube-proof-link">See the benchmarks -></span>
       </a>
