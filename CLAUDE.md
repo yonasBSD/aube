@@ -21,22 +21,55 @@ mise run test:bats                       # Run the full suite in parallel
 mise run test:bats test/install.bats     # Run a single file (or several)
 ```
 
-## Commit Messages
+## Commit Messages (REQUIRED)
 
-Match the existing history: short, imperative subjects with an optional
-lowercase area prefix.
+All commit messages and PR titles MUST follow the aube convention: short,
+imperative subjects with a lowercase area prefix. Aube uses **area-based**
+prefixes (subsystem / crate names), *not* strict conventional-commits
+`feat:` / `fix:` / `chore:` verbs — a commit touching the resolver starts
+with `resolver:`, not `fix(resolver):`. Reserve `feat:` / `fix:` for the
+rare case where no subsystem prefix fits.
 
-- Preferred shape: `area: do the thing`
-- Use a scoped area when it adds useful context, e.g.
-  `docs(installation): add cargo install aube` or
-  `ci(release-plz): grant contents:write to upload-assets caller`.
-- Good recent examples: `cli: add aubr/aubx multicall shims for run and dlx`,
-  `publish: ship aube on npm as @endevco/aube`, and
-  `release: use cross + rustls-tls for linux targets`.
-- Do not prefix commits or PR titles with `[codex]`, agent names, or tool
+**Format:** `<area>(<subscope>): <description>` (subscope is optional)
+
+**Areas:**
+- Crates: `cli`, `resolver`, `registry`, `lockfile`, `store`, `linker`,
+  `manifest`, `scripts`, `workspace`, `settings`
+- Commands / features: `install`, `add`, `publish`, `dlx`, `audit`,
+  `login`, `logout`, `deprecate`, `unpublish`, `fetch`, `import`,
+  `catalog`
+- Infrastructure: `ci`, `docs`, `bench`, `test`, `packaging`, `release`,
+  `chore`
+- Generic fallbacks (only when nothing else fits): `feat`, `fix`
+
+**Subscopes:** narrow the area when it adds useful context, e.g.
+`lockfile(yarn)`, `lockfile(npm)`, `lockfile(bun)`, `bench(hermetic)`,
+`ci(release-plz)`, `ci(ppa-publish)`, `docs(home)`, `docs(installation)`,
+`fix(dlx)`.
+
+**Description style:**
+- Lowercase after the colon
+- Imperative mood ("add feature", not "added feature")
+- Concise but descriptive — for most commits the subject line is the
+  whole message
+
+**Examples (from recent history):**
+- `cli: add aubr/aubx multicall shims for run and dlx`
+- `resolver: preserve npm-alias as folder name on fresh resolve`
+- `store: swap CAS hash from SHA-512 to BLAKE3`
+- `lockfile(yarn): add yarn berry (v2+) parse + write support`
+- `bench(hermetic): warm registry with every PM, pin via .npmrc`
+- `docs(home): plain-English speed copy + link stats to benchmarks`
+- `ci(release-plz): grant contents:write to upload-assets caller`
+- `chore: release v1.0.0-beta.4`
+
+**Do not:**
+- Prefix commits or PR titles with `[codex]`, agent names, or tool
   branding.
-- Do not include PR numbers in local commit messages; GitHub may add those
-  when squash-merging.
+- Include PR numbers in local commit messages; GitHub adds those
+  automatically when squash-merging.
+- Use `feat(<area>):` / `fix(<area>):` when a subsystem prefix exists —
+  prefer `<area>:` directly.
 
 ## Architecture
 
