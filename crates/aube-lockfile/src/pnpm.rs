@@ -528,6 +528,11 @@ pub fn write(path: &Path, graph: &LockfileGraph, manifest: &PackageJson) -> Resu
         // a lockfile written on Windows must resolve identically on
         // Unix and vice versa. `Path::display()` honors the host
         // separator, so it would leak `\` into the YAML.
+        let is_jsr_registry_pkg = pkg.registry_name().starts_with("@jsr/");
+        debug_assert!(
+            !is_jsr_registry_pkg || pkg.tarball_url.is_some(),
+            "JSR packages must preserve dist.tarball for cold lockfile installs"
+        );
         let resolution = match pkg.local_source.as_ref() {
             Some(local @ LocalSource::Directory(_)) => Some(WritableResolution {
                 integrity: None,
@@ -569,13 +574,13 @@ pub fn write(path: &Path, graph: &LockfileGraph, manifest: &PackageJson) -> Resu
             None => pkg.integrity.as_ref().map(|i| WritableResolution {
                 integrity: Some(i.clone()),
                 directory: None,
-                // Emit the full registry tarball URL only when the
-                // `lockfileIncludeTarballUrl` setting opts in AND the
-                // package actually carries a URL (populated at install
-                // time via the registry client). Without the opt-in we
-                // keep the integrity-only form so no-op re-writes stay
-                // byte-identical to pnpm output.
-                tarball: if graph.settings.lockfile_include_tarball_url {
+                // Emit the full registry tarball URL when the setting
+                // opts in. JSR packages are the exception: npm.jsr.io
+                // uses opaque `dist.tarball` paths that cannot be
+                // reconstructed from package name + version, so the
+                // URL must be preserved for cold installs from the
+                // lockfile.
+                tarball: if graph.settings.lockfile_include_tarball_url || is_jsr_registry_pkg {
                     pkg.tarball_url.clone()
                 } else {
                     None
