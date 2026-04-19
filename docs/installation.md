@@ -19,9 +19,11 @@ latest released `aube` from crates.io:
 cargo install aube --locked
 ```
 
+::: info
 `--locked` makes cargo honor the committed `Cargo.lock` so you get the
 same dependency versions CI built against. The compiled binary lands in
 `~/.cargo/bin/aube`.
+:::
 
 ## From npm
 
@@ -33,9 +35,54 @@ npm install -g @endevco/aube
 npx @endevco/aube --version
 ```
 
-Because the install happens via `preinstall`, this does not work with
-`--ignore-scripts` or in offline/air-gapped caches. Prefer mise or
+::: warning
+The `preinstall` script drops the platform-appropriate native binary
+into place. If you install with `--ignore-scripts`, that step is
+skipped and every `aube` invocation goes through a node shim instead
+— which defeats the whole point of having a fast, native CLI. It also
+won't work in offline/air-gapped caches. Prefer mise or
 `cargo install` for those environments.
+:::
+
+## Ubuntu (PPA)
+
+**Supported:** Ubuntu 26.04 (resolute).
+
+Aube publishes signed `.deb` packages to the Launchpad PPA
+[`ppa:jdxcode/aube`](https://launchpad.net/~jdxcode/+archive/ubuntu/aube):
+
+```sh
+sudo apt install -y software-properties-common   # if add-apt-repository isn't already available
+sudo add-apt-repository -y ppa:jdxcode/aube
+sudo apt install aube
+```
+
+Future upgrades go through `apt`:
+
+```sh
+sudo apt update && sudo apt install --only-upgrade aube
+```
+
+## Fedora / RHEL (COPR)
+
+**Supported:** Fedora 42, Fedora 43, Fedora Rawhide, EPEL 9, EPEL 10
+(RHEL / Rocky / Alma 9 and 10), both `x86_64` and `aarch64`.
+
+Aube publishes RPMs to the COPR project
+[`jdxcode/aube`](https://copr.fedorainfracloud.org/coprs/jdxcode/aube/):
+
+```sh
+sudo dnf copr enable jdxcode/aube
+sudo dnf install aube
+```
+
+The `dnf copr` subcommand ships with `dnf-plugins-core` — install that
+first on EPEL and anywhere else the plugin isn't already pulled in.
+Future upgrades go through the package manager:
+
+```sh
+sudo dnf upgrade aube
+```
 
 ## From source
 
