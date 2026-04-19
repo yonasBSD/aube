@@ -519,6 +519,7 @@ pub(crate) fn dedupe_peer_variants(graph: LockfileGraph) -> LockfileGraph {
         times,
         skipped_optional_dependencies,
         catalogs,
+        bun_config_version,
     } = graph;
 
     let mut new_packages: BTreeMap<String, LockedPackage> = BTreeMap::new();
@@ -560,6 +561,7 @@ pub(crate) fn dedupe_peer_variants(graph: LockfileGraph) -> LockfileGraph {
         times,
         skipped_optional_dependencies,
         catalogs,
+        bun_config_version,
     }
 }
 
@@ -689,6 +691,7 @@ fn apply_peer_contexts_once(
         times: canonical.times,
         skipped_optional_dependencies: canonical.skipped_optional_dependencies,
         catalogs: canonical.catalogs,
+        bun_config_version: canonical.bun_config_version,
     }
 }
 
@@ -877,6 +880,11 @@ pub(crate) fn dedupe_peer_suffixes(graph: LockfileGraph) -> LockfileGraph {
                 tarball_url: pkg.tarball_url,
                 alias_of: pkg.alias_of,
                 yarn_checksum: pkg.yarn_checksum,
+                engines: pkg.engines,
+                bin: pkg.bin,
+                declared_dependencies: pkg.declared_dependencies,
+                license: pkg.license,
+                funding_url: pkg.funding_url,
             },
         );
     }
@@ -913,6 +921,7 @@ pub(crate) fn dedupe_peer_suffixes(graph: LockfileGraph) -> LockfileGraph {
         times: graph.times,
         skipped_optional_dependencies: graph.skipped_optional_dependencies,
         catalogs: graph.catalogs,
+        bun_config_version: graph.bun_config_version,
     }
 }
 
@@ -1274,6 +1283,11 @@ fn visit_peer_context(
             tarball_url: pkg.tarball_url.clone(),
             alias_of: pkg.alias_of.clone(),
             yarn_checksum: pkg.yarn_checksum.clone(),
+            engines: pkg.engines.clone(),
+            bin: pkg.bin.clone(),
+            declared_dependencies: pkg.declared_dependencies.clone(),
+            license: pkg.license.clone(),
+            funding_url: pkg.funding_url.clone(),
         },
     );
     Some(contextualized)

@@ -157,6 +157,43 @@ pub struct VersionMetadata {
     pub cpu: Vec<String>,
     #[serde(default, deserialize_with = "string_or_seq")]
     pub libc: Vec<String>,
+    /// `engines:` from the package manifest (e.g. `{node: ">=8"}`).
+    /// Round-tripped into the lockfile so pnpm-compatible output can
+    /// emit `engines: {node: '>=8'}` on package entries without a
+    /// packument re-fetch.
+    #[serde(default, deserialize_with = "non_string_tolerant_map")]
+    pub engines: BTreeMap<String, String>,
+    /// `license:` field from the package manifest. npm's lockfile
+    /// keeps this per-package; other formats don't. Stored as
+    /// `Option<String>` because packuments can emit a bare string
+    /// (`"MIT"`), an SPDX object, or nothing at all — we only keep
+    /// the simple case for lockfile round-trip. Non-string shapes
+    /// degrade to `None` rather than failing to parse the packument.
+    #[serde(default, deserialize_with = "license_string")]
+    pub license: Option<String>,
+    /// `funding:` URL extracted from the manifest's `funding` field.
+    /// The field is documented as a string *or* an object with a
+    /// `url:` key *or* an array of either — npm's lockfile
+    /// normalizes to `{url: …}`, so we only keep the URL and let
+    /// the writer emit the wrapping object. Serde `rename` because
+    /// `rename_all = "camelCase"` would otherwise look for
+    /// `fundingUrl` in the JSON.
+    #[serde(default, rename = "funding", deserialize_with = "funding_url")]
+    pub funding_url: Option<String>,
+    /// `bin:` map from the packument, normalized to `name → path`.
+    ///
+    /// npm records `bin` in two shapes on a manifest: a string
+    /// (`"bin": "cli.js"` — implicitly named after the package) or a
+    /// map (`"bin": {"foo": "cli.js"}` — explicitly named). We
+    /// normalize to the map form at parse time so downstream callers
+    /// don't have to branch: an empty map means "no bins".
+    ///
+    /// pnpm collapses this to `hasBin: true` on its package entries;
+    /// bun preserves the full map on its per-package meta. Keeping
+    /// the map lets us feed both writers without an extra
+    /// tarball-level re-parse.
+    #[serde(default, rename = "bin", deserialize_with = "bin_map")]
+    pub bin: BTreeMap<String, String>,
     #[serde(default)]
     pub has_install_script: bool,
     /// Deprecation message from the registry, if this version is deprecated.
@@ -185,6 +222,96 @@ where
     Ok(match value {
         Some(serde_json::Value::String(s)) if !s.is_empty() => Some(s),
         _ => None,
+    })
+}
+
+/// Accept the packument's `license:` field in any of its documented
+/// shapes (string, `{type, url}` object, or missing) and collapse to
+/// the simple string form npm emits in its lockfile. Non-string
+/// shapes degrade to `None`; we don't try to normalize SPDX
+/// expressions or license-file references here.
+fn license_string<'de, D>(de: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<serde_json::Value>::deserialize(de)?;
+    Ok(match value {
+        Some(serde_json::Value::String(s)) if !s.is_empty() => Some(s),
+        Some(serde_json::Value::Object(m)) => m
+            .get("type")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(String::from),
+        _ => None,
+    })
+}
+
+/// Extract the first `url:` out of a packument's `funding:` field.
+/// The field may be a URL string, a `{url: …}` object, or an array
+/// of either — npm's lockfile normalizes to `{"url": "…"}` on each
+/// package entry, so we only need the URL itself. Missing / empty
+/// / non-url-bearing shapes degrade to `None`.
+fn funding_url<'de, D>(de: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<serde_json::Value>::deserialize(de)?;
+    Ok(match value {
+        Some(serde_json::Value::String(s)) if !s.is_empty() => Some(s),
+        Some(serde_json::Value::Object(m)) => m
+            .get("url")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(String::from),
+        Some(serde_json::Value::Array(arr)) => arr.iter().find_map(|v| match v {
+            serde_json::Value::String(s) if !s.is_empty() => Some(s.clone()),
+            serde_json::Value::Object(m) => m
+                .get("url")
+                .and_then(|u| u.as_str())
+                .filter(|s| !s.is_empty())
+                .map(String::from),
+            _ => None,
+        }),
+        _ => None,
+    })
+}
+
+/// Normalize `package.json` `bin` into a `name → path` map.
+///
+/// Two canonical shapes on the npm registry: a string
+/// (`"bin": "cli.js"` — implicitly keyed by the package name) and a
+/// map (`"bin": {"foo": "cli.js"}`). Older or odd packuments also
+/// surface `null` or an empty string; a missing `bin` field falls
+/// through to the default empty map.
+///
+/// The string-form needs the package name to emit a well-formed map
+/// — which we don't have here at deserialize time. We leave the key
+/// as an empty string; every call site that cares about bin names
+/// (`aube-linker`'s bin-symlink pass, the bun writer) already has
+/// the package name in scope and can patch it up.
+fn bin_map<'de, D>(de: D) -> Result<BTreeMap<String, String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<serde_json::Value>::deserialize(de)?;
+    Ok(match value {
+        None | Some(serde_json::Value::Null) => BTreeMap::new(),
+        // The implicit-name case — keep a single empty-keyed entry so
+        // consumers can still detect presence and patch the name.
+        Some(serde_json::Value::String(s)) if s.is_empty() => BTreeMap::new(),
+        Some(serde_json::Value::String(s)) => {
+            let mut m = BTreeMap::new();
+            m.insert(String::new(), s);
+            m
+        }
+        Some(serde_json::Value::Object(m)) => m
+            .into_iter()
+            .filter_map(|(k, v)| match v {
+                serde_json::Value::String(s) => Some((k, s)),
+                _ => None,
+            })
+            .collect(),
+        Some(_) => BTreeMap::new(),
     })
 }
 
@@ -268,6 +395,63 @@ mod tests {
         assert_eq!(v.os, vec!["linux"]);
         assert_eq!(v.cpu, vec!["x64"]);
         assert_eq!(v.libc, vec!["glibc"]);
+    }
+
+    #[test]
+    fn bin_normalizes_packument_shapes() {
+        let missing = parse(r#"{"name":"x","version":"1.0.0"}"#);
+        assert!(missing.bin.is_empty(), "missing bin → empty map");
+        let empty_string = parse(r#"{"name":"x","version":"1.0.0","bin":""}"#);
+        assert!(empty_string.bin.is_empty(), "empty string bin → empty map");
+        let null_bin = parse(r#"{"name":"x","version":"1.0.0","bin":null}"#);
+        assert!(null_bin.bin.is_empty(), "null bin → empty map");
+        let empty_map = parse(r#"{"name":"x","version":"1.0.0","bin":{}}"#);
+        assert!(empty_map.bin.is_empty(), "empty map bin → empty map");
+        // String bin leaves the name blank — callers patch it with the
+        // package name before materializing a symlink / writing to
+        // bun.lock.
+        let string_bin = parse(r#"{"name":"x","version":"1.0.0","bin":"cli.js"}"#);
+        assert_eq!(string_bin.bin.get(""), Some(&"cli.js".to_string()));
+        let map_bin = parse(r#"{"name":"x","version":"1.0.0","bin":{"foo":"cli.js"}}"#);
+        assert_eq!(map_bin.bin.get("foo"), Some(&"cli.js".to_string()));
+    }
+
+    /// Round-trip the `bin` map through the on-disk cache format
+    /// (serialize → parse). Regression: the disk cache round-trips
+    /// the field under the name `bin`, so the deserializer *must*
+    /// accept a map back (and not interpret the already-normalized
+    /// map as an implicit-name string).
+    #[test]
+    fn bin_map_roundtrips_through_cache_serialization() {
+        let mut bin = BTreeMap::new();
+        bin.insert("semver".to_string(), "bin/semver.js".to_string());
+        let v = VersionMetadata {
+            name: "semver".to_string(),
+            version: "7.7.4".to_string(),
+            dependencies: BTreeMap::new(),
+            dev_dependencies: BTreeMap::new(),
+            peer_dependencies: BTreeMap::new(),
+            peer_dependencies_meta: BTreeMap::new(),
+            optional_dependencies: BTreeMap::new(),
+            bundled_dependencies: None,
+            dist: None,
+            os: Vec::new(),
+            cpu: Vec::new(),
+            libc: Vec::new(),
+            engines: BTreeMap::new(),
+            license: None,
+            funding_url: None,
+            bin,
+            has_install_script: false,
+            deprecated: None,
+        };
+        let json = serde_json::to_string(&v).unwrap();
+        let back: VersionMetadata = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            back.bin.get("semver"),
+            Some(&"bin/semver.js".to_string()),
+            "bin map must round-trip through cache serialization"
+        );
     }
 
     #[test]

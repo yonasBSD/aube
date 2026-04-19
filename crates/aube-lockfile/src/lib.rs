@@ -67,6 +67,14 @@ pub struct LockfileGraph {
     /// for it. Round-tripped through the lockfile so drift detection
     /// can fire when a catalog spec changes without re-resolving.
     pub catalogs: BTreeMap<String, BTreeMap<String, CatalogEntry>>,
+    /// bun's top-level `configVersion` — a second format counter bun
+    /// added alongside `lockfileVersion` to track its own config-
+    /// schema changes. Only the bun parser/writer ever touches this;
+    /// other formats leave it `None`. Round-tripping the parsed
+    /// value keeps the writer from silently downgrading the field
+    /// (e.g. from `2` back to `1`) when bun bumps it in a future
+    /// release.
+    pub bun_config_version: Option<u32>,
 }
 
 /// One entry in a lockfile catalog: the workspace-declared range and the
@@ -510,6 +518,48 @@ pub struct LockedPackage {
     /// `checksum:` field, which berry tolerates at the default
     /// `checksumBehavior: throw` when the cache is fresh.
     pub yarn_checksum: Option<String>,
+    /// `engines:` from the package's manifest, round-tripped through
+    /// the lockfile so pnpm-style writers can emit the same flow-form
+    /// `engines: {node: '>=8'}` line pnpm writes. Empty map means
+    /// "no engines declared" — the writer skips the field entirely.
+    pub engines: BTreeMap<String, String>,
+    /// `bin:` map from the package's manifest, normalized to
+    /// `name → path`. An empty map means "no bins declared".
+    ///
+    /// pnpm-style writers derive `hasBin: true` from
+    /// `!bin.is_empty()` (they don't preserve the names/paths); bun's
+    /// format emits the full map on the package's meta block. Keeping
+    /// the map here lets both writers render byte-identical output
+    /// without an extra tarball-level re-parse.
+    pub bin: BTreeMap<String, String>,
+    /// Dependency ranges as declared in this package's own
+    /// `package.json` — keyed by dep name, values are the raw
+    /// specifiers (`"^4.1.0"`, `"~1.1.4"`, `"workspace:*"`, …).
+    ///
+    /// Distinct from [`Self::dependencies`], which stores the
+    /// *resolved* dep_path tail (`"4.3.0"`). npm / yarn / bun
+    /// lockfiles preserve the declared ranges on every nested
+    /// package entry — rewriting them to the resolved pins is the
+    /// biggest source of round-trip churn against those formats. This
+    /// map lets writers emit the declared range when available and
+    /// fall back to the resolved pin otherwise (e.g. when the source
+    /// lockfile was pnpm, whose `snapshots:` only carries pins).
+    ///
+    /// Empty means "unknown" — writers should fall back to pins.
+    /// Covers production *and* optional dependencies in one map since
+    /// a package can't declare the same name twice across those
+    /// sections.
+    pub declared_dependencies: BTreeMap<String, String>,
+    /// Package's `license` field, collapsed to the simple string
+    /// form. Round-tripped so npm's lockfile keeps its per-entry
+    /// `"license": "MIT"` line; pnpm / yarn / bun don't record
+    /// licenses and leave this `None` on parse.
+    pub license: Option<String>,
+    /// Package's funding URL, extracted from whatever shape the
+    /// manifest's `funding:` field took (string / object / array).
+    /// Round-tripped so npm's lockfile keeps its per-entry
+    /// `"funding": {"url": "…"}` block.
+    pub funding_url: Option<String>,
 }
 
 impl LockedPackage {
@@ -680,6 +730,7 @@ impl LockfileGraph {
             times: self.times.clone(),
             skipped_optional_dependencies: self.skipped_optional_dependencies.clone(),
             catalogs: self.catalogs.clone(),
+            bun_config_version: self.bun_config_version,
         }
     }
 
@@ -735,7 +786,48 @@ impl LockfileGraph {
             times: self.times.clone(),
             skipped_optional_dependencies,
             catalogs: self.catalogs.clone(),
+            bun_config_version: self.bun_config_version,
         })
+    }
+
+    /// Overlay per-package metadata fields from `prior` onto `self`
+    /// for every `(name, version)` that survives in both graphs.
+    /// Carries forward only fields the abbreviated packument (npm
+    /// corgi) doesn't ship — `license`, `funding_url`, and the
+    /// bun-format `configVersion` — so a fresh re-resolve against
+    /// the same spec set doesn't lose them.
+    ///
+    /// Keyed by canonical `name@version`, so a peer-context rewrite
+    /// between the old and new graph still lines up. `self`'s own
+    /// values win when set (fresh registry data is authoritative);
+    /// `prior`'s fill in only the `None` / empty slots. Safe to call
+    /// on any pair of graphs — parsing the old lockfile is the
+    /// caller's concern.
+    pub fn overlay_metadata_from(&mut self, prior: &LockfileGraph) {
+        // Build a canonical `name@version → prior pkg` lookup once so
+        // repeated peer-context variants in `self.packages` all hit
+        // the same prior entry.
+        let mut prior_index: BTreeMap<String, &LockedPackage> = BTreeMap::new();
+        for pkg in prior.packages.values() {
+            prior_index
+                .entry(format!("{}@{}", pkg.name, pkg.version))
+                .or_insert(pkg);
+        }
+        for pkg in self.packages.values_mut() {
+            let key = format!("{}@{}", pkg.name, pkg.version);
+            let Some(prior_pkg) = prior_index.get(&key) else {
+                continue;
+            };
+            if pkg.license.is_none() && prior_pkg.license.is_some() {
+                pkg.license = prior_pkg.license.clone();
+            }
+            if pkg.funding_url.is_none() && prior_pkg.funding_url.is_some() {
+                pkg.funding_url = prior_pkg.funding_url.clone();
+            }
+        }
+        if self.bun_config_version.is_none() {
+            self.bun_config_version = prior.bun_config_version;
+        }
     }
 
     /// Compare this lockfile's root importer against a single manifest.

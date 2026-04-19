@@ -485,6 +485,17 @@ impl Resolver {
         self
     }
 
+    /// Whether the resolver should round-trip registry `time:` entries
+    /// into the output graph. pnpm only writes `time:` to its lockfile
+    /// when one of `resolution-mode=time-based` / `minimumReleaseAge`
+    /// is active — otherwise the field is dead weight and, worse, shows
+    /// up as churn in a pnpm ↔ aube diff. Gate the insertion at the
+    /// two `resolved_times.insert` call sites on this predicate so
+    /// Highest-mode installs never populate the map.
+    fn should_record_times(&self) -> bool {
+        self.resolution_mode == ResolutionMode::TimeBased || self.minimum_release_age.is_some()
+    }
+
     /// Override the default `auto-install-peers=true` behavior. pnpm reads
     /// this from `.npmrc` or `pnpm-workspace.yaml`; aube's install command
     /// plumbs the resolved value through here before running resolution.
@@ -1576,7 +1587,8 @@ impl Resolver {
                             // existing `time:` entry even when this
                             // install reuses the locked version without
                             // re-fetching a packument.
-                            if let Some(g) = existing
+                            if self.should_record_times()
+                                && let Some(g) = existing
                                 && let Some(t) = g.times.get(&dep_path)
                             {
                                 resolved_times.insert(dep_path.clone(), t.clone());
@@ -1628,6 +1640,11 @@ impl Resolver {
                                     tarball_url: locked_pkg.tarball_url.clone(),
                                     alias_of: locked_pkg.alias_of.clone(),
                                     yarn_checksum: locked_pkg.yarn_checksum.clone(),
+                                    engines: locked_pkg.engines.clone(),
+                                    bin: locked_pkg.bin.clone(),
+                                    declared_dependencies: locked_pkg.declared_dependencies.clone(),
+                                    license: locked_pkg.license.clone(),
+                                    funding_url: locked_pkg.funding_url.clone(),
                                 },
                             );
 
@@ -1939,7 +1956,9 @@ impl Resolver {
                 // (v5.15.1+) and full-packument fetches do include it,
                 // and then we round-trip it into the lockfile just like
                 // pnpm does.
-                if let Some(t) = picked_publish_time.as_ref() {
+                if self.should_record_times()
+                    && let Some(t) = picked_publish_time.as_ref()
+                {
                     resolved_times.insert(dep_path.clone(), t.clone());
                 }
 
@@ -2004,13 +2023,17 @@ impl Resolver {
                     .or_default()
                     .push(version.clone());
 
-                let registry_name = task.registry_name();
                 let integrity = version_meta.dist.as_ref().and_then(|d| d.integrity.clone());
-                let tarball_url = version_meta.dist.as_ref().and_then(|d| {
-                    registry_name
-                        .starts_with("@jsr/")
-                        .then(|| d.tarball.clone())
-                });
+                // Always stash the registry tarball URL on the locked
+                // package. pnpm / yarn writers gate emission on
+                // `lockfile_include_tarball_url` (so the pnpm
+                // round-trip stays byte-identical for projects that
+                // opted out); the npm writer emits `resolved:` on
+                // every package entry unconditionally, which is what
+                // npm itself writes. Carrying the URL on every
+                // LockedPackage lets both policies work without a
+                // second packument fetch at write time.
+                let tarball_url = version_meta.dist.as_ref().map(|d| d.tarball.clone());
 
                 // Stream this resolved package for early tarball fetching.
                 // `alias_of` mirrors what the LockedPackage below
@@ -2101,6 +2124,47 @@ impl Resolver {
                         // reader populates this field.
                         alias_of: task.real_name.clone(),
                         yarn_checksum: None,
+                        engines: version_meta.engines.clone(),
+                        // Rehydrate a string-form bin (`"bin": "cli.js"`)
+                        // into `{<package_name>: "cli.js"}` — registry
+                        // packuments leave the name off, expecting
+                        // consumers to default it to the package name.
+                        // Doing it here keeps bun's per-entry meta
+                        // byte-identical to bun's own output without
+                        // pushing the fixup into every writer.
+                        bin: {
+                            let mut m = version_meta.bin.clone();
+                            if let Some(path) = m.remove("") {
+                                // String-form `bin` in a packument
+                                // (`"bin": "cli.js"`) is implicitly
+                                // named after the real registry
+                                // package — not the alias. For an
+                                // aliased dep (`"h3-v2": "npm:h3@…"`)
+                                // the bun writer must emit the bin
+                                // under `h3`, not `h3-v2`, or the
+                                // map drifts against bun's own
+                                // output (and the shim install path
+                                // creates the wrong binary name).
+                                let bin_name =
+                                    task.real_name.as_deref().unwrap_or(&task.name).to_string();
+                                m.insert(bin_name, path);
+                            }
+                            m
+                        },
+                        // Declared ranges straight from the packument's
+                        // `dependencies` / `optionalDependencies`. Fed
+                        // back out by npm / yarn / bun writers so
+                        // nested package entries keep the original
+                        // specifiers instead of collapsing to pins.
+                        declared_dependencies: {
+                            let mut m = version_meta.dependencies.clone();
+                            for (k, v) in &version_meta.optional_dependencies {
+                                m.insert(k.clone(), v.clone());
+                            }
+                            m
+                        },
+                        license: version_meta.license.clone(),
+                        funding_url: version_meta.funding_url.clone(),
                     },
                 );
 
@@ -2357,6 +2421,10 @@ impl Resolver {
             times: resolved_times,
             skipped_optional_dependencies,
             catalogs: resolved_catalogs,
+            // Resolver output is format-agnostic; the bun writer layer
+            // defaults `configVersion` to 1 when emitting a fresh
+            // lockfile.
+            bun_config_version: None,
         };
 
         // Second pass: hoist every auto-installed peer to its importer's
@@ -3208,6 +3276,10 @@ mod tests {
             os: vec![],
             cpu: vec![],
             libc: vec![],
+            engines: BTreeMap::new(),
+            license: None,
+            funding_url: None,
+            bin: BTreeMap::new(),
             has_install_script: false,
             deprecated: None,
         }
@@ -4884,6 +4956,7 @@ mod tests {
             times: BTreeMap::new(),
             skipped_optional_dependencies: BTreeMap::new(),
             catalogs: BTreeMap::new(),
+            bun_config_version: None,
         };
 
         let mut manifest = PackageJson::default();
@@ -4952,6 +5025,7 @@ mod tests {
             times: BTreeMap::new(),
             skipped_optional_dependencies: BTreeMap::new(),
             catalogs: BTreeMap::new(),
+            bun_config_version: None,
         };
 
         let mut manifest = PackageJson::default();

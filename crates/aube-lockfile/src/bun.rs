@@ -40,10 +40,20 @@ use std::path::Path;
 struct RawBunLockfile {
     #[serde(rename = "lockfileVersion")]
     lockfile_version: u32,
+    /// bun 1.2+ emits a `configVersion:` field alongside
+    /// `lockfileVersion:`. Default to `1` for older lockfiles that
+    /// predate it so a v1.1 file round-trips without the field
+    /// suddenly appearing.
+    #[serde(default = "default_config_version", rename = "configVersion")]
+    config_version: u32,
     #[serde(default)]
     workspaces: BTreeMap<String, RawBunWorkspace>,
     #[serde(default)]
     packages: BTreeMap<String, Vec<serde_json::Value>>,
+}
+
+fn default_config_version() -> u32 {
+    1
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -138,6 +148,13 @@ struct RawBunMeta {
     dependencies: BTreeMap<String, String>,
     #[serde(default)]
     optional_dependencies: BTreeMap<String, String>,
+    /// `bin:` map — bun records executables by name on each package's
+    /// meta block (`{ "bin": { "semver": "bin/semver.js" } }`). Round-
+    /// tripping it is what keeps `aube install --no-frozen-lockfile`
+    /// from silently dropping the `bin:` line and drifting against
+    /// bun's own output.
+    #[serde(default)]
+    bin: BTreeMap<String, String>,
 }
 
 /// Parse a bun.lock file into a LockfileGraph.
@@ -203,6 +220,24 @@ pub fn parse(path: &Path) -> Result<LockfileGraph, Error> {
         {
             deps.insert(n.clone(), String::new());
         }
+        // Track which of those are optionals so the writer can split
+        // them back into `optionalDependencies:` instead of dumping
+        // everything under `dependencies:` on re-emit.
+        let mut optional_deps: BTreeMap<String, String> = BTreeMap::new();
+        for n in entry.meta.optional_dependencies.keys() {
+            optional_deps.insert(n.clone(), String::new());
+        }
+        // Preserve bun's per-entry meta ranges (`"^4.1.0"`) so re-emit
+        // doesn't collapse them to the resolved pin.
+        let mut declared: BTreeMap<String, String> = BTreeMap::new();
+        for (k, v) in entry
+            .meta
+            .dependencies
+            .iter()
+            .chain(entry.meta.optional_dependencies.iter())
+        {
+            declared.insert(k.clone(), v.clone());
+        }
 
         packages.insert(
             dep_path.clone(),
@@ -211,7 +246,10 @@ pub fn parse(path: &Path) -> Result<LockfileGraph, Error> {
                 version,
                 integrity: entry.integrity.clone().filter(|s| !s.is_empty()),
                 dependencies: deps,
+                optional_dependencies: optional_deps,
                 dep_path,
+                declared_dependencies: declared,
+                bin: entry.meta.bin.clone(),
                 ..Default::default()
             },
         );
@@ -247,7 +285,25 @@ pub fn parse(path: &Path) -> Result<LockfileGraph, Error> {
     }
     for (dep_path, deps) in resolved_by_dep_path {
         if let Some(pkg) = packages.get_mut(&dep_path) {
+            // Transfer resolved dep_paths onto `dependencies` (the
+            // combined map) and onto `optional_dependencies` for the
+            // subset the parser flagged on first pass. Matches the
+            // pnpm parser's split so every downstream consumer
+            // (linker, writer, drift detection) sees the same shape
+            // regardless of source format.
+            let mut opts = BTreeMap::new();
+            for name in pkg
+                .optional_dependencies
+                .keys()
+                .cloned()
+                .collect::<Vec<_>>()
+            {
+                if let Some(resolved) = deps.get(&name) {
+                    opts.insert(name.clone(), resolved.clone());
+                }
+            }
             pkg.dependencies = deps;
+            pkg.optional_dependencies = opts;
         }
     }
 
@@ -300,6 +356,7 @@ pub fn parse(path: &Path) -> Result<LockfileGraph, Error> {
     Ok(LockfileGraph {
         importers,
         packages,
+        bun_config_version: Some(raw.config_version),
         ..Default::default()
     })
 }
@@ -565,35 +622,42 @@ pub fn write(
         workspace_manifests.insert(importer_path.clone(), pj);
     }
 
-    fn build_workspace_obj(pj: &aube_manifest::PackageJson) -> serde_json::Map<String, Value> {
-        let mut obj = serde_json::Map::new();
+    // Build the `workspaces[path]` object for each importer. bun's
+    // output leaves `version` off every workspace entry (root and
+    // non-root), even when package.json declares one — emitting it
+    // here produces a gratuitous diff on every round-trip against
+    // bun's own output.
+    //
+    // Returns ordered `(key, value)` pairs rather than a `Map` so
+    // the hand-written JSONC emitter can render them in the same
+    // order bun does: `name`, then dep sections.
+    fn build_workspace_pairs(pj: &aube_manifest::PackageJson) -> Vec<(&'static str, Value)> {
+        let mut pairs: Vec<(&'static str, Value)> = Vec::new();
         if let Some(name) = &pj.name {
-            obj.insert("name".to_string(), json!(name));
-        }
-        if let Some(version) = &pj.version {
-            obj.insert("version".to_string(), json!(version));
+            pairs.push(("name", json!(name)));
         }
         if !pj.dependencies.is_empty() {
-            obj.insert("dependencies".to_string(), json!(pj.dependencies));
+            pairs.push(("dependencies", json!(pj.dependencies)));
         }
         if !pj.dev_dependencies.is_empty() {
-            obj.insert("devDependencies".to_string(), json!(pj.dev_dependencies));
+            pairs.push(("devDependencies", json!(pj.dev_dependencies)));
         }
         if !pj.optional_dependencies.is_empty() {
-            obj.insert(
-                "optionalDependencies".to_string(),
-                json!(pj.optional_dependencies),
-            );
+            pairs.push(("optionalDependencies", json!(pj.optional_dependencies)));
         }
         if !pj.peer_dependencies.is_empty() {
-            obj.insert("peerDependencies".to_string(), json!(pj.peer_dependencies));
+            pairs.push(("peerDependencies", json!(pj.peer_dependencies)));
         }
-        obj
+        pairs
     }
 
-    let root_obj = build_workspace_obj(manifest);
+    let mut workspace_pairs: Vec<(String, Vec<(&'static str, Value)>)> = Vec::new();
+    workspace_pairs.push(("".to_string(), build_workspace_pairs(manifest)));
+    for (importer_path, pj) in &workspace_manifests {
+        workspace_pairs.push((importer_path.clone(), build_workspace_pairs(pj)));
+    }
 
-    let mut packages_obj = serde_json::Map::new();
+    let mut package_entries: Vec<(String, Value)> = Vec::new();
     for (segs, canonical_key) in &tree {
         let Some(pkg) = canonical.get(canonical_key).copied() else {
             continue;
@@ -605,21 +669,66 @@ pub fn write(
         // recognizes `@`-prefixed segments as a single unit.
         let bun_key = segs.join("/");
 
-        // Metadata object: transitive deps keyed by name → version.
-        // Filter out deps we don't have a canonical entry for (e.g.
-        // dropped optional deps).
+        // Metadata object: transitive deps keyed by name → declared
+        // range (e.g. `"^4.1.0"`). Fall back to the resolved pin when
+        // the declared range is unknown — happens for lockfiles that
+        // came through a format without declared ranges (pnpm's
+        // `snapshots:` stores pins only). Filter out deps we don't
+        // have a canonical entry for (e.g. dropped optional deps).
+        //
+        // Split the combined `dependencies` map back into
+        // `dependencies` + `optionalDependencies` on emission so
+        // packages that originally declared optionals round-trip
+        // through bun's parser with the same classification.
         let mut deps_obj = serde_json::Map::new();
+        let mut opt_deps_obj = serde_json::Map::new();
         for (dep_name, dep_value) in &pkg.dependencies {
             let key = crate::npm::child_canonical_key(dep_name, dep_value);
             if !canonical.contains_key(&key) {
                 continue;
             }
-            let version = crate::npm::dep_value_as_version(dep_name, dep_value);
-            deps_obj.insert(dep_name.clone(), Value::String(version.to_string()));
+            let rendered = pkg
+                .declared_dependencies
+                .get(dep_name)
+                .cloned()
+                .unwrap_or_else(|| {
+                    crate::npm::dep_value_as_version(dep_name, dep_value).to_string()
+                });
+            if pkg.optional_dependencies.contains_key(dep_name) {
+                opt_deps_obj.insert(dep_name.clone(), Value::String(rendered));
+            } else {
+                deps_obj.insert(dep_name.clone(), Value::String(rendered));
+            }
         }
         let mut meta = serde_json::Map::new();
         if !deps_obj.is_empty() {
             meta.insert("dependencies".to_string(), Value::Object(deps_obj));
+        }
+        if !opt_deps_obj.is_empty() {
+            meta.insert(
+                "optionalDependencies".to_string(),
+                Value::Object(opt_deps_obj),
+            );
+        }
+        // Preserve the full `bin:` map — bun's meta block records
+        // executables by name so `bun install --frozen-lockfile` can
+        // recreate the `.bin` shims without re-reading each tarball's
+        // manifest. pnpm collapses this to `hasBin: true`; we keep
+        // both representations on `LockedPackage.bin` so either
+        // writer can render byte-identical output.
+        //
+        // Skip empty-key entries — those are the placeholder bins
+        // pnpm's lockfile synthesizes when it knows `hasBin: true`
+        // but has no paths. Emitting them would produce a
+        // `{"bin": {"": ""}}` block bun wouldn't accept.
+        let real_bins: serde_json::Map<String, Value> = pkg
+            .bin
+            .iter()
+            .filter(|(k, _)| !k.is_empty())
+            .map(|(k, v)| (k.clone(), Value::String(v.clone())))
+            .collect();
+        if !real_bins.is_empty() {
+            meta.insert("bin".to_string(), Value::Object(real_bins));
         }
 
         let ident = format!("{}@{}", pkg.name, pkg.version);
@@ -630,28 +739,142 @@ pub fn write(
             Value::Object(meta),
             Value::String(integrity),
         ]);
-        packages_obj.insert(bun_key, entry);
+        package_entries.push((bun_key, entry));
     }
 
-    let mut workspaces_obj = serde_json::Map::new();
-    workspaces_obj.insert("".to_string(), Value::Object(root_obj));
-    for (importer_path, pj) in &workspace_manifests {
-        workspaces_obj.insert(
-            importer_path.clone(),
-            Value::Object(build_workspace_obj(pj)),
-        );
-    }
-
-    let mut doc = serde_json::Map::new();
-    doc.insert("lockfileVersion".to_string(), json!(1));
-    doc.insert("workspaces".to_string(), Value::Object(workspaces_obj));
-    doc.insert("packages".to_string(), Value::Object(packages_obj));
-
-    let mut body = serde_json::to_string_pretty(&Value::Object(doc))
-        .map_err(|e| Error::Parse(path.to_path_buf(), e.to_string()))?;
-    body.push('\n');
+    // Echo back the parsed `configVersion` (default 1 for older v1.1
+    // lockfiles that predate the field) so a bun-bumped value round-
+    // trips instead of silently downgrading on re-emit.
+    let config_version = graph.bun_config_version.unwrap_or(1);
+    let body = format_bun_lockfile(&workspace_pairs, &package_entries, config_version);
     std::fs::write(path, body).map_err(|e| Error::Io(path.to_path_buf(), e))?;
     Ok(())
+}
+
+/// Hand-written JSONC emitter matching bun 1.2's `bun.lock` style.
+///
+/// bun's output has an idiosyncratic shape — nested object fields use
+/// trailing commas (standard JSONC) except `packages:` itself (the
+/// last top-level field, where bun omits the trailing comma and leaves
+/// the closing brace bare) — and every `packages:` entry is serialized
+/// as a single-line array with a blank separator above. serde_json's
+/// `to_string_pretty` can't express any of that, so we build the
+/// output by hand.
+///
+/// `workspaces` is the ordered list of `(path, pairs)` where `path` is
+/// the workspace key in `workspaces[]` (`""` for the root,
+/// `"packages/app"` for non-root) and `pairs` are the ordered
+/// key/value entries inside. `package_entries` are the `packages:`
+/// map in BTreeMap order — each is rendered as a single-line
+/// `[ident, "", {meta}, integrity]` array.
+///
+/// `config_version` is echoed back into the output as bun itself does —
+/// hardcoding would silently downgrade the field when bun bumps it.
+fn format_bun_lockfile(
+    workspaces: &[(String, Vec<(&'static str, serde_json::Value)>)],
+    package_entries: &[(String, serde_json::Value)],
+    config_version: u32,
+) -> String {
+    let mut out = String::with_capacity(8192);
+    out.push_str("{\n");
+    out.push_str("  \"lockfileVersion\": 1,\n");
+    out.push_str(&format!("  \"configVersion\": {config_version},\n"));
+
+    // Workspaces block. Emits root (`""`) first, then each non-root
+    // workspace in the order the caller supplied.
+    out.push_str("  \"workspaces\": {\n");
+    for (path, pairs) in workspaces.iter() {
+        out.push_str(&format!(
+            "    {}: {{\n",
+            serde_json::to_string(path).unwrap()
+        ));
+        for (k, v) in pairs.iter() {
+            let key_str = serde_json::to_string(k).unwrap();
+            // bun emits a trailing comma after every workspace-level
+            // field, including the last one — `},` closes the block.
+            match v {
+                serde_json::Value::Object(map) if !map.is_empty() => {
+                    // Multi-line block — bun expands workspace dep maps
+                    // even when small.
+                    out.push_str(&format!("      {key_str}: {{\n"));
+                    for (dk, dv) in map {
+                        out.push_str(&format!(
+                            "        {}: {},\n",
+                            serde_json::to_string(dk).unwrap(),
+                            inline_json(dv, 0)
+                        ));
+                    }
+                    out.push_str("      },\n");
+                }
+                _ => {
+                    out.push_str(&format!("      {key_str}: {},\n", inline_json(v, 0)));
+                }
+            }
+        }
+        // bun emits a trailing comma on every workspace entry,
+        // including the last one — the outer `"workspaces"` map's
+        // own trailing comma still closes the block below.
+        out.push_str("    },\n");
+    }
+    out.push_str("  },\n");
+
+    // Packages block. Each entry is its own line; bun separates
+    // entries with a blank line (an empty line between every
+    // consecutive pair). `packages:` is bun's last top-level field and
+    // gets no trailing comma on its closing brace.
+    out.push_str("  \"packages\": {\n");
+    for (i, (key, entry)) in package_entries.iter().enumerate() {
+        if i > 0 {
+            out.push('\n');
+        }
+        out.push_str(&format!(
+            "    {}: {},\n",
+            serde_json::to_string(key).unwrap(),
+            inline_json(entry, 0)
+        ));
+    }
+    out.push_str("  }\n");
+    out.push_str("}\n");
+    out
+}
+
+/// Serialize a JSON value inline in bun's spaced style — objects as
+/// `{ "k": v, "k2": v2 }` (with a trailing space before `}` and a
+/// trailing comma before the close), arrays as `["a", "b"]` (no
+/// trailing comma). Recurses into nested objects/arrays.
+///
+/// `base_indent` is reserved for a future multi-line fallback when an
+/// object gets too wide; bun in 1.2 keeps even the larger metadata
+/// objects on one line, so we currently ignore it.
+fn inline_json(value: &serde_json::Value, _base_indent: usize) -> String {
+    use serde_json::Value;
+    match value {
+        Value::Null => "null".to_string(),
+        Value::Bool(b) => b.to_string(),
+        Value::Number(n) => n.to_string(),
+        Value::String(_) => serde_json::to_string(value).unwrap(),
+        Value::Array(arr) => {
+            let parts: Vec<String> = arr.iter().map(|v| inline_json(v, 0)).collect();
+            format!("[{}]", parts.join(", "))
+        }
+        Value::Object(map) => {
+            if map.is_empty() {
+                return "{}".to_string();
+            }
+            let parts: Vec<String> = map
+                .iter()
+                .map(|(k, v)| {
+                    format!(
+                        "{}: {}",
+                        serde_json::to_string(k).unwrap(),
+                        inline_json(v, 0)
+                    )
+                })
+                .collect();
+            // bun writes `{ k: v, k2: v2 }` — spaces inside, no trailing comma.
+            format!("{{ {} }}", parts.join(", "))
+        }
+    }
 }
 
 #[cfg(test)]
@@ -957,6 +1180,86 @@ mod tests {
                 .get("bar")
                 .map(String::as_str),
             Some("bar@1.0.0")
+        );
+    }
+
+    /// Byte-parity with a real `bun install`-generated lockfile — the
+    /// fixture at `tests/fixtures/bun-native.lock` was produced by
+    /// bun 1.3 against a `{ chalk, picocolors, semver }` manifest. A
+    /// parse → write round-trip must reproduce the exact bytes;
+    /// anything less means `aube install --no-frozen-lockfile` churns
+    /// someone's bun.lock in git when nothing in the graph moved.
+    /// Covers the format fixes (`configVersion`, no workspace
+    /// `version`, trailing commas, single-line package arrays) plus
+    /// the data-model fixes that ride with them (declared-range
+    /// preservation in `declared_dependencies`, `bin:` map
+    /// round-trip).
+    #[test]
+    fn test_write_byte_identical_to_native_bun() {
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/bun-native.lock");
+        // Normalize line endings — Windows' `core.autocrlf=true` can
+        // rewrite the checked-out fixture to CRLF even with
+        // `.gitattributes eol=lf`; compare against LF form explicitly.
+        let original = std::fs::read_to_string(&fixture)
+            .unwrap()
+            .replace("\r\n", "\n");
+        let graph = parse(&fixture).unwrap();
+        let manifest = aube_manifest::PackageJson {
+            name: Some("aube-lockfile-stability".to_string()),
+            version: Some("1.0.0".to_string()),
+            dependencies: [
+                ("chalk".to_string(), "^4.1.2".to_string()),
+                ("picocolors".to_string(), "^1.1.1".to_string()),
+                ("semver".to_string(), "^7.6.3".to_string()),
+            ]
+            .into_iter()
+            .collect(),
+            ..Default::default()
+        };
+
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        write(tmp.path(), &graph, &manifest).unwrap();
+        let written = std::fs::read_to_string(tmp.path()).unwrap();
+
+        if written != original {
+            panic!(
+                "bun writer drifted from native bun output.\n\n--- expected ---\n{original}\n--- got ---\n{written}"
+            );
+        }
+    }
+
+    /// `configVersion` must echo back whatever was parsed, not a
+    /// hardcoded `1`. Regression guard for a future bun release that
+    /// bumps the field — without this, aube would silently downgrade
+    /// every re-emit and drift against bun's own output.
+    #[test]
+    fn test_write_roundtrips_config_version() {
+        let project = tempfile::TempDir::new().unwrap();
+        let pj = project.path().join("package.json");
+        std::fs::write(&pj, r#"{"name":"root","dependencies":{}}"#).unwrap();
+        let lock_path = project.path().join("bun.lock");
+        std::fs::write(
+            &lock_path,
+            r#"{
+  "lockfileVersion": 1,
+  "configVersion": 42,
+  "workspaces": {
+    "": { "name": "root" }
+  },
+  "packages": {}
+}"#,
+        )
+        .unwrap();
+
+        let graph = parse(&lock_path).unwrap();
+        assert_eq!(graph.bun_config_version, Some(42));
+
+        let manifest = aube_manifest::PackageJson::from_path(&pj).unwrap();
+        write(&lock_path, &graph, &manifest).unwrap();
+        let written = std::fs::read_to_string(&lock_path).unwrap();
+        assert!(
+            written.contains("\"configVersion\": 42,"),
+            "configVersion must round-trip verbatim, got:\n{written}"
         );
     }
 

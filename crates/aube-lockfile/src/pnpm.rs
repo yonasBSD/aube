@@ -285,6 +285,20 @@ pub fn parse(path: &Path) -> Result<LockfileGraph, Error> {
         let os = pkg_info.map(|p| p.os.clone()).unwrap_or_default();
         let cpu = pkg_info.map(|p| p.cpu.clone()).unwrap_or_default();
         let libc = pkg_info.map(|p| p.libc.clone()).unwrap_or_default();
+        let engines = pkg_info.map(|p| p.engines.clone()).unwrap_or_default();
+        // pnpm's lockfile only stores `hasBin: true/false` (no paths);
+        // reconstruct an opaque single-entry map on parse so
+        // `!bin.is_empty()` stays equivalent to `hasBin`, then let
+        // downstream writers fill in real paths when they have them.
+        // The map key + value are placeholders — writers that care
+        // about bin names (bun) read from richer sources.
+        let bin = if pkg_info.map(|p| p.has_bin).unwrap_or(false) {
+            let mut m = BTreeMap::new();
+            m.insert(String::new(), String::new());
+            m
+        } else {
+            BTreeMap::new()
+        };
         // Aube-specific extension (see `WritablePackageInfo::alias_of`)
         // — ordinary pnpm lockfiles never carry it, so this stays
         // `None` on pnpm-authored input and round-trips the resolver-
@@ -310,6 +324,21 @@ pub fn parse(path: &Path) -> Result<LockfileGraph, Error> {
                 tarball_url,
                 alias_of,
                 yarn_checksum: None,
+                engines,
+                bin,
+                // pnpm's `snapshots:` only records resolved pins, so
+                // the parser has no declared ranges to restore. Left
+                // empty; npm / yarn / bun writers fall back to pins
+                // when re-emitting a pnpm-sourced graph into one of
+                // their formats.
+                declared_dependencies: BTreeMap::new(),
+                // pnpm's format doesn't carry per-package license or
+                // funding metadata, so a pnpm → npm conversion
+                // degrades to empty rather than re-fetching each
+                // packument. npm writers skip these fields when
+                // `None`.
+                license: None,
+                funding_url: None,
             },
         );
     }
@@ -363,6 +392,7 @@ pub fn parse(path: &Path) -> Result<LockfileGraph, Error> {
         times,
         skipped_optional_dependencies,
         catalogs,
+        bun_config_version: None,
     })
 }
 
@@ -594,11 +624,17 @@ pub fn write(path: &Path, graph: &LockfileGraph, manifest: &PackageJson) -> Resu
             canonical,
             WritablePackageInfo {
                 resolution,
-                peer_dependencies: peer_deps,
-                peer_dependencies_meta: peer_meta,
+                engines: if pkg.engines.is_empty() {
+                    None
+                } else {
+                    Some(pkg.engines.clone())
+                },
                 os: pkg.os.clone(),
                 cpu: pkg.cpu.clone(),
                 libc: pkg.libc.clone(),
+                has_bin: !pkg.bin.is_empty(),
+                peer_dependencies: peer_deps,
+                peer_dependencies_meta: peer_meta,
                 // Preserve the alias→real-name mapping so a subsequent
                 // install from this lockfile still hits the real
                 // registry instead of re-404ing on the alias-qualified
@@ -708,8 +744,102 @@ pub fn write(path: &Path, graph: &LockfileGraph, manifest: &PackageJson) -> Resu
 
     let yaml = serde_yaml::to_string(&lockfile)
         .map_err(|e| Error::Parse(path.to_path_buf(), e.to_string()))?;
+    let yaml = reformat_for_pnpm_parity(&yaml);
     std::fs::write(path, yaml).map_err(|e| Error::Io(path.to_path_buf(), e))?;
     Ok(())
+}
+
+/// Post-process a `serde_yaml`-emitted pnpm-lock.yaml into the exact
+/// shape real pnpm writes. Two tweaks:
+///
+///   1. Collapse `resolution:` / `engines:` block maps into flow form
+///      (`resolution: {integrity: sha512-…}`). pnpm writes both inline
+///      and `serde_yaml` can't be coerced into flow style per-field
+///      without a custom emitter.
+///   2. Insert blank-line separators above every top-level section
+///      (`settings:`, `importers:`, `packages:`, `snapshots:`, …) and
+///      between 2-indent entries inside the entry-bearing sections
+///      (`importers:`, `packages:`, `snapshots:`, `catalogs:`).
+///
+/// The rewrites are textual — not YAML-aware — but the keys aube emits
+/// are all simple scalars in the fixed set above, so there's nothing to
+/// quote-escape. Validated by `test_write_byte_identical_to_native_pnpm`.
+fn reformat_for_pnpm_parity(yaml: &str) -> String {
+    let lines: Vec<&str> = yaml.lines().collect();
+
+    // Pass 1: flow-style `resolution:` / `engines:` blocks.
+    let mut compact: Vec<String> = Vec::with_capacity(lines.len());
+    let mut i = 0;
+    while i < lines.len() {
+        let line = lines[i];
+        let stripped = line.trim_start();
+        let indent = line.len() - stripped.len();
+        let key = stripped.strip_suffix(':');
+        let is_flow_candidate = matches!(key, Some("resolution") | Some("engines"));
+        if is_flow_candidate && i + 1 < lines.len() {
+            let inner_indent = indent + 2;
+            let mut entries: Vec<String> = Vec::new();
+            let mut j = i + 1;
+            while j < lines.len() {
+                let next = lines[j];
+                let n_stripped = next.trim_start();
+                let n_indent = next.len() - n_stripped.len();
+                if n_stripped.is_empty() || n_indent != inner_indent {
+                    break;
+                }
+                match n_stripped.split_once(": ") {
+                    Some((k, v)) => entries.push(format!("{k}: {v}")),
+                    None => break,
+                }
+                j += 1;
+            }
+            if !entries.is_empty() {
+                compact.push(format!(
+                    "{}{}: {{{}}}",
+                    " ".repeat(indent),
+                    key.unwrap(),
+                    entries.join(", ")
+                ));
+                i = j;
+                continue;
+            }
+        }
+        compact.push(line.to_string());
+        i += 1;
+    }
+
+    // Pass 2: blank-line separators.
+    // Sections where each 2-indent key-ending-in-`:` is an entry header
+    // that pnpm separates with a blank line above. `overrides:` /
+    // `time:` / `settings:` carry scalar key→value pairs instead and
+    // stay tight.
+    const ENTRY_SECTIONS: &[&str] = &["importers:", "packages:", "snapshots:", "catalogs:"];
+    let mut out = String::with_capacity(yaml.len() + 512);
+    let mut in_entries = false;
+    for (idx, line) in compact.iter().enumerate() {
+        let stripped = line.trim_start();
+        let indent = line.len() - stripped.len();
+        let is_top = indent == 0 && !stripped.is_empty();
+        // Entry headers inside `packages:` / `snapshots:` are always at
+        // 2-indent with a `:` in the line. Either trailing (`foo@1:`
+        // with a child block below) or inline (`foo@1: {}` for empty
+        // snapshots). List markers (`- …`) never appear at this level,
+        // so a leading `-` rules out false positives on
+        // `ignoredOptionalDependencies:` items.
+        let is_entry_header =
+            in_entries && indent == 2 && !stripped.starts_with('-') && stripped.contains(':');
+
+        if (is_top && idx > 0) || is_entry_header {
+            out.push('\n');
+        }
+        out.push_str(line);
+        out.push('\n');
+
+        if is_top {
+            in_entries = ENTRY_SECTIONS.contains(&stripped);
+        }
+    }
+    out
 }
 
 fn version_to_dep_path(name: &str, version: &str) -> String {
@@ -852,22 +982,33 @@ struct WritablePeerDepMeta {
     optional: bool,
 }
 
-// Field order matches pnpm v9's `packages:` entries: resolution first,
-// then peerDependencies, then peerDependenciesMeta. Don't reorder.
+// Field order matches pnpm v9's `packages:` entries: resolution, then
+// engines, then os/cpu/libc, then hasBin, then peerDependencies /
+// peerDependenciesMeta. Don't reorder.
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct WritablePackageInfo {
     #[serde(skip_serializing_if = "Option::is_none")]
     resolution: Option<WritableResolution>,
-    // pnpm v9 emits os/cpu/libc immediately after `resolution` and
-    // before `peerDependencies`. Keep this order to stay byte-
-    // identical with pnpm-written lockfiles for native packages.
+    /// pnpm writes `engines: {node: '>=8'}` in flow form immediately
+    /// after `resolution:` when the package declared any engines.
+    /// Emitted as a block map here — `reformat_for_pnpm_parity` flips it
+    /// to flow form to match pnpm byte-for-byte.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    engines: Option<BTreeMap<String, String>>,
+    // pnpm v9 emits os/cpu/libc after `engines` and before `hasBin`.
+    // Keep this order to stay byte-identical with pnpm-written lockfiles
+    // for native packages.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     os: Vec<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     cpu: Vec<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     libc: Vec<String>,
+    /// pnpm emits `hasBin: true` only when the package has executables;
+    /// `hasBin: false` is never written. Skip the default to match.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    has_bin: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     peer_dependencies: Option<BTreeMap<String, String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -954,6 +1095,8 @@ struct RawCatalogEntry {
 #[serde(rename_all = "camelCase")]
 struct RawPackageInfo {
     resolution: Option<Resolution>,
+    #[serde(default)]
+    engines: BTreeMap<String, String>,
     peer_dependencies: Option<BTreeMap<String, String>>,
     peer_dependencies_meta: Option<BTreeMap<String, RawPeerDepMeta>>,
     #[serde(default)]
@@ -962,6 +1105,8 @@ struct RawPackageInfo {
     cpu: Vec<String>,
     #[serde(default)]
     libc: Vec<String>,
+    #[serde(default)]
+    has_bin: bool,
     /// Paired writer field. See `WritablePackageInfo::alias_of`. `None`
     /// for ordinary (non-aliased) packages.
     #[serde(default)]
@@ -1705,5 +1850,115 @@ snapshots:
     fn test_parse_nonexistent_file() {
         let path = Path::new("/nonexistent/pnpm-lock.yaml");
         assert!(parse(path).is_err());
+    }
+
+    // Byte-parity with a real pnpm-lock.yaml. The fixture was produced by
+    // `pnpm install` against a `{ chalk, picocolors, semver }` manifest and
+    // lightly pinned — if pnpm's own output format drifts in a future
+    // release, regenerate the fixture rather than loosening the assertion.
+    // The test guards against silent regressions in the four churn sources
+    // we fixed: stray `time:`, block-form `resolution:`, missing blank
+    // lines, and dropped `engines:` / `hasBin:`.
+    #[test]
+    fn test_write_byte_identical_to_native_pnpm() {
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/pnpm-native.yaml");
+        // Windows' `core.autocrlf=true` rewrites checked-out files to
+        // CRLF even when `.gitattributes` asks for LF; normalize both
+        // sides before comparing so a misconfigured checkout gets a
+        // meaningful failure rather than a line-ending false positive.
+        let original = std::fs::read_to_string(&fixture)
+            .unwrap()
+            .replace("\r\n", "\n");
+
+        let graph = parse(&fixture).unwrap();
+        let manifest = PackageJson {
+            name: Some("aube-lockfile-stability".to_string()),
+            version: Some("1.0.0".to_string()),
+            dependencies: [
+                ("chalk".to_string(), "^4.1.2".to_string()),
+                ("picocolors".to_string(), "^1.1.1".to_string()),
+                ("semver".to_string(), "^7.6.3".to_string()),
+            ]
+            .into_iter()
+            .collect(),
+            ..Default::default()
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("pnpm-lock.yaml");
+        write(&out, &graph, &manifest).unwrap();
+        let written = std::fs::read_to_string(&out).unwrap();
+
+        if written != original {
+            // pretty-print a short contextual diff so CI logs are actionable.
+            let diff = similar_diff(&original, &written);
+            panic!(
+                "pnpm writer drifted from native pnpm output:\n{diff}\n\n--- full written output ---\n{written}"
+            );
+        }
+    }
+
+    // Minimal line diff for the byte-parity test failure message. We don't
+    // pull in a diff crate just for this — the lockfile is small enough
+    // that a line-by-line comparison is readable.
+    /// Line-aligned diff with a bounded lookahead so a single
+    /// insertion doesn't flag every following line as "modified".
+    /// When sides diverge at `(i, j)`, scan up to `LOOKAHEAD` steps in
+    /// both directions for the nearest `al[ii] == bl[jj]` and emit the
+    /// skipped-over ranges as `- …` / `+ …` runs; that keeps the
+    /// failure output readable for the ≤100-line fixtures this test
+    /// exercises without pulling in a full LCS dependency.
+    fn similar_diff(a: &str, b: &str) -> String {
+        const LOOKAHEAD: usize = 8;
+        let al: Vec<&str> = a.lines().collect();
+        let bl: Vec<&str> = b.lines().collect();
+        let mut out = String::new();
+        let (mut i, mut j) = (0usize, 0usize);
+        while i < al.len() || j < bl.len() {
+            if i < al.len() && j < bl.len() && al[i] == bl[j] {
+                i += 1;
+                j += 1;
+                continue;
+            }
+            // Find the nearest resync point within the lookahead
+            // window. `k` is the combined distance from `(i, j)`;
+            // smaller `k` wins, matching how a developer eyeballs
+            // the diff.
+            let mut sync: Option<(usize, usize)> = None;
+            'outer: for k in 1..=LOOKAHEAD {
+                for dx in 0..=k {
+                    let dy = k - dx;
+                    let ii = i + dx;
+                    let jj = j + dy;
+                    if ii < al.len() && jj < bl.len() && al[ii] == bl[jj] {
+                        sync = Some((ii, jj));
+                        break 'outer;
+                    }
+                }
+            }
+            match sync {
+                Some((ii, jj)) => {
+                    for line in &al[i..ii] {
+                        out.push_str(&format!("  - {line:?}\n"));
+                    }
+                    for line in &bl[j..jj] {
+                        out.push_str(&format!("  + {line:?}\n"));
+                    }
+                    i = ii;
+                    j = jj;
+                }
+                None => {
+                    // No sync in the window — dump the rest and stop.
+                    for line in &al[i..] {
+                        out.push_str(&format!("  - {line:?}\n"));
+                    }
+                    for line in &bl[j..] {
+                        out.push_str(&format!("  + {line:?}\n"));
+                    }
+                    break;
+                }
+            }
+        }
+        out
     }
 }
