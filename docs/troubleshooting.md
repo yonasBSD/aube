@@ -1,5 +1,29 @@
 # Troubleshooting
 
+## Try disabling the global virtual store first
+
+If an install or build is behaving oddly, turn the global virtual
+store off for the project before digging further:
+
+```sh
+aube config set enableGlobalVirtualStore false --location project
+```
+
+Symptoms that usually point here:
+
+- `Symlink ... is invalid, it points out of the filesystem root`
+- `ENOENT: no such file or directory` for a module that clearly exists
+  under `node_modules/.aube/`
+- `Cannot find module '<pkg>'` from Next.js / Turbopack, Vite,
+  VitePress, Nuxt, or Parcel during dev or build
+- Plugin config discovery (PostCSS, Tailwind, Vite) silently misses a
+  config file that lives at the project root
+- `ERR_INVALID_PACKAGE_TARGET` or exports-resolution failures for a
+  package that resolves fine under pnpm/npm
+
+See [Global virtual store](/package-manager/node-modules#global-virtual-store)
+for what this changes.
+
 ## A package is missing from `node_modules`
 
 Run:
