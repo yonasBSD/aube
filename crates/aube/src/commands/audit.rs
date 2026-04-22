@@ -162,13 +162,36 @@ pub async fn run(args: AuditArgs, registry_override: Option<&str>) -> miette::Re
         Ok(v) => v,
         Err(e) => {
             if args.ignore_registry_errors {
+                // Old code here printed "No known vulnerabilities
+                // found" and exited 0. That is a false negative. User
+                // passed --ignore-registry-errors to keep CI green
+                // when offline, but silently claiming clean audit can
+                // mask real CVEs. If the registry was down on a scan
+                // day, whole pipeline would ship vuln'd code with a
+                // "passed" audit step. Now: report degraded status,
+                // exit non-zero. CI fails loudly. JSON consumers
+                // check `status` field.
                 eprintln!("warn: advisory fetch failed: {e}");
                 if args.json {
-                    println!("{{}}");
+                    // Build the JSON via serde_json so the error
+                    // message gets properly escaped. Hand-rolled
+                    // string interpolation broke on errors that
+                    // contained `"` (connection refused sometimes
+                    // surfaces quoted URL text), producing
+                    // malformed JSON that downstream consumers
+                    // could not parse.
+                    let reason = format!("advisory fetch failed: {e}");
+                    let body = serde_json::json!({
+                        "status": "degraded",
+                        "reason": reason,
+                    });
+                    println!("{body}");
                 } else {
-                    println!("No known vulnerabilities found");
+                    eprintln!(
+                        "audit degraded: advisory fetch failed, vulnerability status unknown"
+                    );
                 }
-                return Ok(());
+                std::process::exit(2);
             }
             return Err(miette!("advisory fetch failed: {e}"));
         }
@@ -410,13 +433,39 @@ async fn write_fix_overrides(
     }
 
     let json = serde_json::to_string_pretty(&root).into_diagnostic()?;
-    std::fs::write(&manifest_path, format!("{json}\n"))
-        .into_diagnostic()
+    write_manifest_atomic(&manifest_path, format!("{json}\n").as_bytes())
         .wrap_err("failed to write package.json")?;
     eprintln!(
         "Updated package.json overrides for {} package(s).",
         fixes.len()
     );
+    Ok(())
+}
+
+/// Atomic package.json write via tempfile + rename. Crash or Ctrl+C
+/// mid-write used to leave the user with a truncated manifest,
+/// worst-case aube failure mode. Matches the pattern used in
+/// add/remove/state.
+fn write_manifest_atomic(path: &std::path::Path, body: &[u8]) -> miette::Result<()> {
+    let parent = path.parent().unwrap_or_else(|| std::path::Path::new("."));
+    let tmp = tempfile::Builder::new()
+        .prefix(".aube-audit-")
+        .suffix(".tmp")
+        .tempfile_in(parent)
+        .into_diagnostic()
+        .wrap_err_with(|| format!("failed to open tempfile for {}", path.display()))?;
+    {
+        use std::io::Write as _;
+        let mut f = tmp.as_file();
+        f.write_all(body)
+            .into_diagnostic()
+            .wrap_err_with(|| format!("failed to write tempfile for {}", path.display()))?;
+        f.sync_all()
+            .into_diagnostic()
+            .wrap_err_with(|| format!("failed to sync tempfile for {}", path.display()))?;
+    }
+    tmp.persist(path)
+        .map_err(|e| miette!("failed to persist {}: {e}", path.display()))?;
     Ok(())
 }
 
