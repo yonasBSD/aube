@@ -474,6 +474,45 @@ pub(super) async fn import_local_source(
             .map_err(|e| miette!("git clone task panicked: {e}"))?
             .map_err(|e| miette!("failed to clone {spec}: {e}"))?;
 
+            // `&path:/<sub>` narrows the package root to a
+            // subdirectory of the cloned repo (pnpm-compatible).
+            // Everything below this line — manifest read, prepare
+            // scratch copy, archive build, plain directory import —
+            // operates on the subdir rather than the whole clone.
+            //
+            // Defense in depth against a `..`-laden subpath: the
+            // parser already rejects them, but we also canonicalize
+            // and assert the result stays under `clone_dir` so a
+            // future code path that fills `subpath` from a different
+            // source can't bypass the check.
+            let pkg_root = match &g.subpath {
+                Some(sub) => clone_dir.join(sub),
+                None => clone_dir.clone(),
+            };
+            if !pkg_root.is_dir() {
+                return Err(miette!(
+                    "git dep {spec}: subpath {} not found in clone",
+                    pkg_root.display()
+                ));
+            }
+            if g.subpath.is_some() {
+                let canonical_clone = clone_dir
+                    .canonicalize()
+                    .into_diagnostic()
+                    .wrap_err_with(|| format!("canonicalize clone dir for {spec}"))?;
+                let canonical_pkg = pkg_root
+                    .canonicalize()
+                    .into_diagnostic()
+                    .wrap_err_with(|| format!("canonicalize subpath for {spec}"))?;
+                if !canonical_pkg.starts_with(&canonical_clone) {
+                    return Err(miette!(
+                        "git dep {spec}: subpath {} escapes clone root {}",
+                        canonical_pkg.display(),
+                        canonical_clone.display()
+                    ));
+                }
+            }
+
             // If the cloned repo defines a `prepare` script, treat
             // it as a source checkout that needs to be built before
             // we snapshot it. Matches npm/pnpm: a TypeScript repo
@@ -492,7 +531,7 @@ pub(super) async fn import_local_source(
             // through to the plain directory import. Matches pnpm,
             // which skips `prepare` for git deps under
             // `--ignore-scripts` as well.
-            let manifest_path = clone_dir.join("package.json");
+            let manifest_path = pkg_root.join("package.json");
             let needs_prepare = !ignore_scripts
                 && aube_manifest::PackageJson::from_path(&manifest_path)
                     .ok()
@@ -515,7 +554,7 @@ pub(super) async fn import_local_source(
                 //
                 // `ScratchDir` removes the copy on drop, including
                 // on the error path.
-                let scratch = prepare_scratch_copy(&clone_dir, &spec)?;
+                let scratch = prepare_scratch_copy(&pkg_root, &spec)?;
                 run_git_dep_prepare(scratch.path(), &spec, ignore_scripts, git_prepare_depth)
                     .await?;
                 let archive = crate::commands::pack::build_archive(scratch.path())
@@ -527,7 +566,7 @@ pub(super) async fn import_local_source(
             }
 
             let index = store
-                .import_directory(&clone_dir)
+                .import_directory(&pkg_root)
                 .map_err(|e| miette!("failed to import {}: {e}", local.specifier()))?;
             Ok(Some(index))
         }
