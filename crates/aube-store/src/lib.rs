@@ -176,8 +176,8 @@ impl Store {
         verify_files: bool,
     ) -> Option<PackageIndex> {
         let index_path = self.index_path(name, version, integrity)?;
-        let content = xx::file::read_to_string(&index_path).ok()?;
-        let index: PackageIndex = serde_json::from_str(&content).ok()?;
+        let mut buf = xx::file::read(&index_path).ok()?;
+        let index: PackageIndex = simd_json::serde::from_slice(&mut buf).ok()?;
         if verify_files {
             if !index.values().all(|f| f.store_path.exists()) {
                 trace!("cache stale: {name}@{version}");
@@ -474,7 +474,8 @@ impl Store {
         // truncate into a partial index.
         let gz = flate2::read::GzDecoder::new(tarball_bytes);
         let capped = CappedReader::new(gz, MAX_TARBALL_DECOMPRESSED_BYTES);
-        let mut archive = tar::Archive::new(capped);
+        let buffered = std::io::BufReader::with_capacity(256 * 1024, capped);
+        let mut archive = tar::Archive::new(buffered);
         let mut index = BTreeMap::new();
         let mut entries_seen: usize = 0;
 
@@ -997,8 +998,12 @@ pub fn validate_pkg_content(
         .ok_or_else(|| Error::Tar("package.json missing from tarball".to_string()))?;
     let bytes =
         std::fs::read(&stored.store_path).map_err(|e| Error::Io(stored.store_path.clone(), e))?;
-    let v: serde_json::Value = serde_json::from_slice(&bytes)
-        .map_err(|e| Error::Tar(format!("invalid package.json: {e}")))?;
+    let v: serde_json::Value = {
+        let mut buf = bytes.clone();
+        simd_json::serde::from_slice(&mut buf)
+            .or_else(|_| serde_json::from_slice(&bytes))
+            .map_err(|e| Error::Tar(format!("invalid package.json: {e}")))?
+    };
     let actual_name = v.get("name").and_then(|n| n.as_str()).unwrap_or("");
     let actual_version = v.get("version").and_then(|v| v.as_str()).unwrap_or("");
     // Tolerate a leading `v` on the tarball's version (e.g. "v2.0.8").
