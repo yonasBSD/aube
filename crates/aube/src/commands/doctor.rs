@@ -11,8 +11,11 @@
 //! they can be reused from more focused commands in the future without
 //! round-tripping through the formatter.
 //!
-//! Side-effect free: reads config, package.json, `.aube-state`, and walks
-//! `node_modules/.aube/` — but never writes, never hits the network.
+//! The diagnostic itself is read-only: reads config, package.json,
+//! `.aube-state`, and walks `node_modules/.aube/` — never writes the
+//! project. After the report renders, fires the async update notifier
+//! (network-bound on a cold cache, cached for 24 h thereafter), which
+//! also writes `<cacheDir>/update-check.json` on a successful fetch.
 
 use clap::Args;
 use miette::Context;
@@ -50,6 +53,8 @@ pub async fn run(args: DoctorArgs) -> miette::Result<()> {
     } else {
         print_human(&report);
     }
+
+    crate::update_check::check_and_notify(&anchor).await;
 
     if !report.errors.is_empty() {
         std::process::exit(1);
