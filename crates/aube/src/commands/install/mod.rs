@@ -1589,24 +1589,51 @@ pub async fn run(opts: InstallOptions) -> miette::Result<()> {
         None
     };
 
-    // Surgical `--fix-lockfile` support: when we're in Fix mode and a
-    // lockfile parses cleanly, hand it to the resolver as `existing`
-    // so unchanged specs reuse their already-pinned versions. Entries
-    // whose spec drifted fall through the resolver's version-satisfies
-    // fast path and get re-resolved naturally. On Fix with no lockfile
-    // present, this stays `None` and Fix degrades to a fresh resolve.
+    // Hand any parseable lockfile to the resolver as `existing` so
+    // unchanged specs reuse their already-pinned versions and only
+    // entries whose spec actually drifted get re-resolved. Without
+    // this, `aube install` after any manifest edit re-resolves every
+    // transitive against the latest packument and silently bumps
+    // versions that the previous lockfile had pinned (e.g.
+    // `electron-to-chromium@1.5.344` → `1.5.343`), which is the
+    // opposite of what pnpm/bun's default `install` does.
+    //
+    // Scope:
+    //   - Fix: existing behavior (`--fix-lockfile`).
+    //   - Prefer: default mode; the bug above lives here.
+    //   - Frozen: short-circuits to the lockfile-as-truth branch and
+    //     never calls the resolver, so parsing is wasted work.
+    //   - No (`--no-frozen-lockfile`): kept as fresh-resolve so users
+    //     who reach for that flag to bump transitives still get a
+    //     fresh pass. Matching pnpm's "lockfile may drift but locked
+    //     versions are still preferred" semantics is a separate
+    //     decision and would change observable behavior on this path.
     //
     // We parse once and keep both the graph and its kind so the
     // `--lockfile-only` block below can reuse the same result for its
     // freshness check instead of re-reading + re-parsing the same file.
-    let fix_mode_parse: Option<(aube_lockfile::LockfileGraph, aube_lockfile::LockfileKind)> =
-        if mode == FrozenMode::Fix && lockfile_enabled {
-            aube_lockfile::parse_lockfile_with_kind(&cwd, &manifest).ok()
+    //
+    // Hard-fail on a real parse error: the prior in-arm parse in
+    // `FrozenMode::Prefer` propagated parse errors out of
+    // `lockfile_result`, and silently swallowing them here would leave
+    // a corrupt lockfile masquerading as "no lockfile" and trigger a
+    // full re-resolve without surfacing the actionable diagnostic.
+    // `NotFound` is the one error we treat as expected — it just means
+    // the lockfile is absent, which the downstream arms already handle.
+    let lockfile_pre_parse: Option<(aube_lockfile::LockfileGraph, aube_lockfile::LockfileKind)> =
+        if lockfile_enabled && matches!(mode, FrozenMode::Fix | FrozenMode::Prefer) {
+            match aube_lockfile::parse_lockfile_with_kind(&cwd, &manifest) {
+                Ok(parsed) => Some(parsed),
+                Err(aube_lockfile::Error::NotFound(_)) => None,
+                Err(e) => {
+                    return Err(miette::Report::new(e)).wrap_err("failed to parse lockfile");
+                }
+            }
         } else {
             None
         };
     let existing_for_resolver: Option<&aube_lockfile::LockfileGraph> =
-        fix_mode_parse.as_ref().map(|(g, _)| g);
+        lockfile_pre_parse.as_ref().map(|(g, _)| g);
 
     // `--lockfile-only` short-circuit. Resolves (or reuses a fresh
     // lockfile), writes the new lockfile, and exits before any tarball
@@ -1623,16 +1650,16 @@ pub async fn run(opts: InstallOptions) -> miette::Result<()> {
         // or CI's auto-Frozen) a fresh lockfile is a no-op — for Fix
         // specifically, "fresh" means "nothing to fix."
         let force_resolve = matches!(mode, FrozenMode::No);
-        // Reuse the Fix-mode pre-parse when we already have it so we
+        // Reuse the up-front pre-parse when we already have it so we
         // don't read and parse the same lockfile twice on
-        // `--fix-lockfile --lockfile-only`. The borrowed form is all
-        // the freshness check needs — `existing_for_resolver` still
-        // points at the same graph for the resolver call below.
+        // `--lockfile-only`. The borrowed form is all the freshness
+        // check needs — `existing_for_resolver` still points at the
+        // same graph for the resolver call below.
         let parsed_owned;
         let parsed: Result<
             (&aube_lockfile::LockfileGraph, aube_lockfile::LockfileKind),
             &aube_lockfile::Error,
-        > = if let Some((g, k)) = fix_mode_parse.as_ref() {
+        > = if let Some((g, k)) = lockfile_pre_parse.as_ref() {
             Ok((g, *k))
         } else {
             parsed_owned = aube_lockfile::parse_lockfile_with_kind(&cwd, &manifest);
@@ -1911,8 +1938,12 @@ pub async fn run(opts: InstallOptions) -> miette::Result<()> {
             FrozenMode::Prefer => {
                 // Use the lockfile when fresh, otherwise pretend there isn't one
                 // so the existing "no lockfile → resolve" branch handles it.
-                match aube_lockfile::parse_lockfile_with_kind(&cwd, &manifest) {
-                    Ok((graph, kind)) => {
+                // Reuse `lockfile_pre_parse` instead of parsing the same file
+                // a second time — on Prefer-fresh we clone the graph so the
+                // borrow held by `existing_for_resolver` keeps pointing at
+                // the original (unused on the fresh path, but safe to leave).
+                match lockfile_pre_parse.as_ref() {
+                    Some((graph, kind)) => {
                         if let DriftStatus::Stale { reason } =
                             graph.check_catalogs_drift(&workspace_catalogs)
                         {
@@ -1927,7 +1958,7 @@ pub async fn run(opts: InstallOptions) -> miette::Result<()> {
                                 &ws_config_shared.ignored_optional_dependencies,
                                 &workspace_catalogs,
                             ) {
-                                DriftStatus::Fresh => Ok((graph, kind)),
+                                DriftStatus::Fresh => Ok((graph.clone(), *kind)),
                                 DriftStatus::Stale { reason } => {
                                     tracing::debug!(
                                         "Lockfile out of date ({reason}), re-resolving..."
@@ -1937,7 +1968,7 @@ pub async fn run(opts: InstallOptions) -> miette::Result<()> {
                             }
                         }
                     }
-                    other => other,
+                    None => Err(aube_lockfile::Error::NotFound(cwd.clone())),
                 }
             }
         }
@@ -2401,9 +2432,12 @@ pub async fn run(opts: InstallOptions) -> miette::Result<()> {
             });
 
             // Run resolution (this streams packages to the fetch coordinator).
-            // `existing_for_resolver` is `Some` only in `--fix-lockfile` mode;
-            // in every other fresh-resolve path it's `None`, matching the
-            // previous behavior.
+            // `existing_for_resolver` is `Some` when Fix / Prefer parsed a
+            // lockfile cleanly; the resolver reuses already-pinned versions
+            // for unchanged specs and only re-resolves entries whose spec
+            // drifted. `No` mode (`--no-frozen-lockfile`) intentionally
+            // stays at `None` so the user gets the fresh resolve they
+            // asked for.
             let resolve_result = if has_workspace {
                 resolver
                     .resolve_workspace(&manifests, existing_for_resolver, &ws_package_versions)
