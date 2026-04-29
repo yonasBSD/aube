@@ -558,9 +558,25 @@ pub fn load_both(
     Ok((typed, raw))
 }
 
-/// Resolve which workspace-yaml path `add_to_allow_builds` should
-/// mutate in `project_dir`. Existing `aube-workspace.yaml` wins
-/// over `pnpm-workspace.yaml`; when neither exists, create
+/// Path to the existing workspace yaml in `project_dir`, if any.
+/// `aube-workspace.yaml` wins over `pnpm-workspace.yaml` so an
+/// aube-native project's preferences override a co-existing pnpm
+/// fallback. Returns `None` when neither file exists — read-or-skip
+/// callers (catalog cleanup, ancestor walks) treat that as "nothing
+/// to read or rewrite".
+pub fn workspace_yaml_existing(project_dir: &Path) -> Option<PathBuf> {
+    for name in WORKSPACE_YAML_NAMES {
+        let path = project_dir.join(name);
+        if path.exists() {
+            return Some(path);
+        }
+    }
+    None
+}
+
+/// Resolve which workspace-yaml path a writer should mutate in
+/// `project_dir`. Existing `aube-workspace.yaml` wins over
+/// `pnpm-workspace.yaml`; when neither exists, falls back to
 /// `aube-workspace.yaml` — aube's own filename, parallel to the
 /// `aube-lock.yaml` shape we use for the lockfile.
 ///
@@ -571,41 +587,310 @@ pub fn load_both(
 /// project's filesystem layout matches aube's overall naming
 /// (`aube-lock.yaml`, `aube-workspace.yaml`) rather than mixing
 /// vendor namespaces.
-pub fn workspace_yaml_target(project_dir: &Path) -> std::path::PathBuf {
-    for name in WORKSPACE_YAML_NAMES {
-        let path = project_dir.join(name);
-        if path.exists() {
-            return path;
-        }
-    }
-    project_dir.join("aube-workspace.yaml")
+///
+/// Most writers should go through [`config_write_target`] instead,
+/// which only resolves to the workspace yaml when one already exists
+/// on disk. This raw helper is for the rare caller that genuinely
+/// needs a workspace yaml path even on a fresh project (e.g. the
+/// node-gyp bootstrap dummy file).
+pub fn workspace_yaml_target(project_dir: &Path) -> PathBuf {
+    workspace_yaml_existing(project_dir).unwrap_or_else(|| project_dir.join("aube-workspace.yaml"))
 }
 
-/// Merge `names` into the workspace's `allowBuilds` map.
+/// Where the next mutation of a workspace-level setting should land.
+/// `pnpm.<key>` in `package.json` and the workspace yaml hold the same
+/// shape for almost every aube-mutated setting (`patchedDependencies`,
+/// `allowBuilds`, future settings) so there is one rule that applies
+/// to all of them — see [`config_write_target`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConfigWriteTarget {
+    /// Mutate `pnpm.<key>` in `package.json` via [`edit_setting_map`].
+    PackageJson,
+    /// Mutate the existing workspace yaml at this path via
+    /// [`edit_workspace_yaml`].
+    WorkspaceYaml(PathBuf),
+}
+
+/// Pick which file a workspace-level config write should mutate. Pure
+/// file-existence rule: when the workspace yaml exists, write there
+/// (the pnpm v10+ canonical home, where YAML comments can document
+/// each entry); otherwise write to `package.json`. We deliberately do
+/// not introspect contents — a project with a workspace yaml gets all
+/// its workspace-level config there even when prior entries lived in
+/// `package.json`.
 ///
-/// Write-target precedence:
-/// 1. `aube-workspace.yaml` if it exists — top-level `allowBuilds`.
-/// 2. `pnpm-workspace.yaml` if it exists — top-level `allowBuilds`.
-/// 3. Otherwise — create `aube-workspace.yaml` with top-level
-///    `allowBuilds` (matches aube's `aube-lock.yaml` naming).
+/// Used by every aube command that mutates a setting which can live in
+/// either file (`aube patch-commit`, `aube patch-remove`,
+/// `aube approve-builds`, install-time auto-deny seeding, …).
+pub fn config_write_target(project_dir: &Path) -> ConfigWriteTarget {
+    match workspace_yaml_existing(project_dir) {
+        Some(path) => ConfigWriteTarget::WorkspaceYaml(path),
+        None => ConfigWriteTarget::PackageJson,
+    }
+}
+
+/// Drop `entry_key` from `pnpm.<key>` and `aube.<key>` in
+/// `package.json`. Returns `Ok(true)` when at least one namespace held
+/// it. Empty inner maps and empty namespaces are scrubbed too. The
+/// rewrite is skipped entirely when nothing structural changes —
+/// mirrors the no-op-skip guarantee of [`edit_workspace_yaml`].
+///
+/// Walking both namespaces matters because the read side merges them
+/// (`aube.*` wins on conflict), so an entry recorded in either
+/// location is live; a one-namespace removal would leave a stale
+/// duplicate behind.
+pub fn remove_setting_entry(cwd: &Path, key: &str, entry_key: &str) -> Result<bool, crate::Error> {
+    let path = cwd.join("package.json");
+    if !path.exists() {
+        return Ok(false);
+    }
+    let raw = std::fs::read_to_string(&path).map_err(|e| crate::Error::Io(path.clone(), e))?;
+    let mut value = crate::parse_json::<serde_json::Value>(&path, raw)?;
+    let obj = value.as_object_mut().ok_or_else(|| {
+        crate::Error::YamlParse(path.clone(), "package.json is not an object".to_string())
+    })?;
+    let before = obj.clone();
+
+    let mut existed = false;
+    for ns in ["pnpm", "aube"] {
+        let mut ns_empty = false;
+        if let Some(ns_obj) = obj.get_mut(ns).and_then(|v| v.as_object_mut()) {
+            if let Some(inner) = ns_obj.get_mut(key).and_then(|v| v.as_object_mut()) {
+                if inner.remove(entry_key).is_some() {
+                    existed = true;
+                }
+                if inner.is_empty() {
+                    ns_obj.remove(key);
+                }
+            }
+            ns_empty = ns_obj.is_empty();
+        }
+        if ns_empty {
+            obj.remove(ns);
+        }
+    }
+
+    if *obj == before {
+        return Ok(existed);
+    }
+
+    let mut out = serde_json::to_string_pretty(&value)
+        .map_err(|e| crate::Error::YamlParse(path.clone(), format!("failed to serialize: {e}")))?;
+    out.push('\n');
+    std::fs::write(&path, out).map_err(|e| crate::Error::Io(path, e))?;
+    Ok(existed)
+}
+
+/// Mutate a namespaced map setting (e.g. `patchedDependencies`,
+/// `allowBuilds`) inside `package.json` and write back.
+///
+/// The closure receives a **merged** view of `pnpm.<key>` and
+/// `aube.<key>`, with `aube.*` winning on key conflict — the same
+/// precedence the read side already uses. After the closure runs,
+/// the merged result is written to a single namespace and the other
+/// is cleared, so a future read sees exactly one source of truth and
+/// can never silently shadow a stale entry. This matters because
+/// pnpm-aware tools (and pnpm itself) can introduce a `pnpm` key into
+/// a manifest after aube has already populated `aube.<key>`; without
+/// the merge-and-collapse, a re-record would leave the new value in
+/// `pnpm.<key>` while the stale `aube.<key>` entry kept winning on
+/// read.
+///
+/// The chosen namespace follows [`config_write_target`]'s rule:
+/// `pnpm` if a `pnpm` namespace is already declared in the manifest,
+/// `aube` otherwise. Empty namespaces and inner maps are scrubbed,
+/// and the rewrite is skipped entirely when nothing structural
+/// changes — mirrors the no-op-skip guarantee of [`edit_workspace_yaml`].
+pub fn edit_setting_map<F>(cwd: &Path, key: &str, f: F) -> Result<(), crate::Error>
+where
+    F: FnOnce(&mut serde_json::Map<String, serde_json::Value>),
+{
+    let path = cwd.join("package.json");
+    let raw = std::fs::read_to_string(&path).map_err(|e| crate::Error::Io(path.clone(), e))?;
+    let mut value = crate::parse_json::<serde_json::Value>(&path, raw)?;
+
+    let obj = value.as_object_mut().ok_or_else(|| {
+        crate::Error::YamlParse(path.clone(), "package.json is not an object".to_string())
+    })?;
+    let before = obj.clone();
+
+    // Build the merged view (pnpm first, aube overrides on conflict)
+    // before mutating, so the closure sees the same map the install
+    // path would.
+    let mut merged: serde_json::Map<String, serde_json::Value> = serde_json::Map::new();
+    for ns in ["pnpm", "aube"] {
+        if let Some(inner) = obj
+            .get(ns)
+            .and_then(serde_json::Value::as_object)
+            .and_then(|m| m.get(key))
+            .and_then(serde_json::Value::as_object)
+        {
+            for (k, v) in inner {
+                merged.insert(k.clone(), v.clone());
+            }
+        }
+    }
+
+    f(&mut merged);
+
+    let chosen_ns = if obj.contains_key("pnpm") {
+        "pnpm"
+    } else {
+        "aube"
+    };
+    let other_ns = if chosen_ns == "pnpm" { "aube" } else { "pnpm" };
+
+    // Drop `<key>` from the other namespace so the post-write state
+    // has one source of truth.
+    let mut other_ns_empty_after = false;
+    if let Some(other_obj) = obj.get_mut(other_ns).and_then(|v| v.as_object_mut()) {
+        other_obj.remove(key);
+        other_ns_empty_after = other_obj.is_empty();
+    }
+    if other_ns_empty_after {
+        obj.remove(other_ns);
+    }
+
+    // Write merged into the chosen namespace, or scrub it if empty.
+    if merged.is_empty() {
+        let mut chosen_ns_empty_after = false;
+        if let Some(chosen_obj) = obj.get_mut(chosen_ns).and_then(|v| v.as_object_mut()) {
+            chosen_obj.remove(key);
+            chosen_ns_empty_after = chosen_obj.is_empty();
+        }
+        if chosen_ns_empty_after {
+            obj.remove(chosen_ns);
+        }
+    } else {
+        let chosen_value = obj
+            .entry(chosen_ns.to_string())
+            .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+        let chosen_obj = chosen_value.as_object_mut().ok_or_else(|| {
+            crate::Error::YamlParse(path.clone(), format!("`{chosen_ns}` is not an object"))
+        })?;
+        chosen_obj.insert(key.to_string(), serde_json::Value::Object(merged));
+    }
+
+    if *obj == before {
+        return Ok(());
+    }
+
+    let mut out = serde_json::to_string_pretty(&value)
+        .map_err(|e| crate::Error::YamlParse(path.clone(), format!("failed to serialize: {e}")))?;
+    out.push('\n');
+    std::fs::write(&path, out).map_err(|e| crate::Error::Io(path, e))?;
+    Ok(())
+}
+
+/// Merge `names` into the project's `allowBuilds` map. Routes through
+/// [`config_write_target`]: workspace yaml when one exists, otherwise
+/// `package.json#pnpm.allowBuilds`. Returns the file that was written.
 ///
 /// `allowed=true` is used by `aube approve-builds`; `allowed=false` is
-/// used by install to seed unreviewed packages for later review. Returns
-/// the file that was written.
+/// used by install to seed unreviewed packages for later review. The
+/// install-time seed is idempotent — names already on the list are
+/// left at their existing value, and the underlying writers skip the
+/// rewrite when nothing structural changed.
 pub fn add_to_allow_builds(
     project_dir: &Path,
     names: &[String],
     allowed: bool,
-) -> Result<std::path::PathBuf, crate::Error> {
-    let path = workspace_yaml_target(project_dir);
-    write_to_yaml(&path, names, allowed)
+) -> Result<PathBuf, crate::Error> {
+    match config_write_target(project_dir) {
+        ConfigWriteTarget::WorkspaceYaml(path) => write_allow_builds_yaml(&path, names, allowed),
+        ConfigWriteTarget::PackageJson => {
+            edit_setting_map(project_dir, "allowBuilds", |map| {
+                for name in names {
+                    if allowed {
+                        map.insert(name.clone(), serde_json::Value::Bool(true));
+                    } else {
+                        map.entry(name.clone())
+                            .or_insert(serde_json::Value::Bool(false));
+                    }
+                }
+            })?;
+            Ok(project_dir.join("package.json"))
+        }
+    }
 }
 
-fn write_to_yaml(
+/// Insert or replace a single `patchedDependencies` entry in the
+/// workspace yaml at `path`. Creates the file (and the
+/// `patchedDependencies` mapping) if needed. The shared
+/// [`edit_workspace_yaml`] helper skips the rewrite when the closure
+/// produces no structural change, so an idempotent re-record after
+/// editing the patch file leaves yaml comments intact.
+pub fn upsert_workspace_patched_dependency(
     path: &Path,
-    names: &[String],
-    allowed: bool,
-) -> Result<std::path::PathBuf, crate::Error> {
+    key: &str,
+    rel_patch_path: &str,
+) -> Result<PathBuf, crate::Error> {
+    edit_workspace_yaml(path, |map| {
+        let pd_map = workspace_yaml_submap(map, "patchedDependencies", path)?;
+        pd_map.insert(
+            yaml_serde::Value::String(key.to_string()),
+            yaml_serde::Value::String(rel_patch_path.to_string()),
+        );
+        Ok(())
+    })
+}
+
+/// Drop a `patchedDependencies` entry from the workspace yaml at
+/// `path`. Returns `Ok(true)` when the entry was removed (and the
+/// file was rewritten). When the removal empties
+/// `patchedDependencies` we drop the key from the document so we
+/// don't leave a `patchedDependencies: {}` stub behind.
+pub fn remove_workspace_patched_dependency(path: &Path, key: &str) -> Result<bool, crate::Error> {
+    let mut existed = false;
+    edit_workspace_yaml(path, |map| {
+        let pd_map = workspace_yaml_submap(map, "patchedDependencies", path)?;
+        existed = pd_map.shift_remove(key).is_some();
+        if pd_map.is_empty() {
+            map.shift_remove("patchedDependencies");
+        }
+        Ok(())
+    })?;
+    Ok(existed)
+}
+
+/// Get the inner mapping for a top-level workspace-yaml key, creating
+/// it if absent. Errors when the key exists but isn't a mapping (a
+/// hand-edited file shape we shouldn't silently replace).
+fn workspace_yaml_submap<'a>(
+    map: &'a mut yaml_serde::Mapping,
+    key: &str,
+    path: &Path,
+) -> Result<&'a mut yaml_serde::Mapping, crate::Error> {
+    let entry = map
+        .entry(yaml_serde::Value::String(key.to_string()))
+        .or_insert_with(|| yaml_serde::Value::Mapping(yaml_serde::Mapping::new()));
+    entry.as_mapping_mut().ok_or_else(|| {
+        crate::Error::YamlParse(path.to_path_buf(), format!("`{key}` must be a mapping"))
+    })
+}
+
+/// Apply `f` to the parsed top-level mapping of the workspace yaml at
+/// `path` and write it back. The helper exists so every workspace-yaml
+/// writer (allowBuilds, patchedDependencies, catalog cleanup, future
+/// settings) shares one comment-preserving rule: **the file is left
+/// untouched whenever `f` produces no structural change**.
+///
+/// `yaml_serde` is not a comment-preserving parser — every round trip
+/// strips user-authored comments and reflows the layout. That means a
+/// "no-op" edit (inserting an entry that already exists, removing one
+/// that isn't there, re-recording an unchanged value) would still
+/// rewrite the file and silently destroy the comments the workspace
+/// yaml was chosen to host.
+///
+/// Comparing the parsed `Value` before and after the closure catches
+/// all of those cases without needing per-call peeks. When `f` does
+/// produce a structural change, the user has explicitly asked for a
+/// rewrite and the comment loss is unavoidable until aube migrates to
+/// a comment-preserving YAML library.
+pub fn edit_workspace_yaml<F>(path: &Path, f: F) -> Result<PathBuf, crate::Error>
+where
+    F: FnOnce(&mut yaml_serde::Mapping) -> Result<(), crate::Error>,
+{
     use yaml_serde::{Mapping, Value};
 
     let mut doc: Value = if path.exists() {
@@ -627,24 +912,10 @@ fn write_to_yaml(
         )
     })?;
 
-    let key = Value::String("allowBuilds".to_string());
-    let existing = map
-        .entry(key.clone())
-        .or_insert_with(|| Value::Mapping(Mapping::new()));
-    let allow_builds = existing.as_mapping_mut().ok_or_else(|| {
-        crate::Error::YamlParse(
-            path.to_path_buf(),
-            "`allowBuilds` must be a mapping".to_string(),
-        )
-    })?;
-
-    for name in names {
-        let key = Value::String(name.clone());
-        if allowed {
-            allow_builds.insert(key, Value::Bool(true));
-        } else {
-            allow_builds.entry(key).or_insert(Value::Bool(false));
-        }
+    let before = map.clone();
+    f(map)?;
+    if *map == before {
+        return Ok(path.to_path_buf());
     }
 
     let raw = yaml_serde::to_string(&doc)
@@ -658,6 +929,27 @@ fn write_to_yaml(
     aube_util::fs_atomic::atomic_write(path, indented.as_bytes())
         .map_err(|e| crate::Error::Io(path.to_path_buf(), e))?;
     Ok(path.to_path_buf())
+}
+
+fn write_allow_builds_yaml(
+    path: &Path,
+    names: &[String],
+    allowed: bool,
+) -> Result<PathBuf, crate::Error> {
+    edit_workspace_yaml(path, |map| {
+        let allow_builds = workspace_yaml_submap(map, "allowBuilds", path)?;
+        for name in names {
+            let key = yaml_serde::Value::String(name.clone());
+            if allowed {
+                allow_builds.insert(key, yaml_serde::Value::Bool(true));
+            } else {
+                allow_builds
+                    .entry(key)
+                    .or_insert(yaml_serde::Value::Bool(false));
+            }
+        }
+        Ok(())
+    })
 }
 
 /// Bump every block-sequence item line (`- ...`) by two spaces. Leaves
@@ -853,13 +1145,12 @@ patchedDependencies:
     }
 
     #[test]
-    fn add_to_allow_builds_creates_aube_workspace_when_no_yaml() {
-        // When no workspace yaml exists yet, aube creates
-        // `aube-workspace.yaml` (parallels `aube-lock.yaml`).
-        // Existing `pnpm-workspace.yaml` files are still read +
-        // mutated in place — see
-        // `add_to_allow_builds_writes_to_existing_pnpm_workspace`
-        // for that branch.
+    fn add_to_allow_builds_writes_to_package_json_when_no_yaml() {
+        // No yaml on disk, no `pnpm` namespace in package.json: the
+        // setting lands under `aube.allowBuilds` per the shared
+        // `config_write_target` rule. Tests for the existing-yaml
+        // branch live in `add_to_allow_builds_writes_to_existing_pnpm_workspace`
+        // and `add_to_allow_builds_writes_to_aube_file_when_present`.
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
             dir.path().join("package.json"),
@@ -872,16 +1163,16 @@ patchedDependencies:
             true,
         )
         .unwrap();
-        assert_eq!(path, dir.path().join("aube-workspace.yaml"));
-        let config = WorkspaceConfig::load(dir.path()).unwrap();
-        assert!(matches!(
-            config.allow_builds.get("esbuild"),
-            Some(yaml_serde::Value::Bool(true))
-        ));
-        assert!(matches!(
-            config.allow_builds.get("sharp"),
-            Some(yaml_serde::Value::Bool(true))
-        ));
+        assert_eq!(path, dir.path().join("package.json"));
+        let raw = std::fs::read_to_string(dir.path().join("package.json")).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(parsed["aube"]["allowBuilds"]["esbuild"], true);
+        assert_eq!(parsed["aube"]["allowBuilds"]["sharp"], true);
+        // Existing manifest keys are preserved.
+        assert_eq!(parsed["name"], "solo");
+        // No yaml file should have been created.
+        assert!(!dir.path().join("aube-workspace.yaml").exists());
+        assert!(!dir.path().join("pnpm-workspace.yaml").exists());
     }
 
     #[test]
@@ -936,7 +1227,28 @@ patchedDependencies:
 
     #[test]
     fn add_to_allow_builds_writes_false_for_review() {
+        // Install-time auto-deny seed. Without a yaml on disk it lands
+        // in package.json under the `aube` namespace; the install
+        // codepath always operates on a project that has package.json.
         let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("package.json"), "{}\n").unwrap();
+        add_to_allow_builds(dir.path(), &["esbuild".to_string()], false).unwrap();
+        let raw = std::fs::read_to_string(dir.path().join("package.json")).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(parsed["aube"]["allowBuilds"]["esbuild"], false);
+    }
+
+    #[test]
+    fn add_to_allow_builds_writes_false_for_review_yaml() {
+        // Same scenario as `add_to_allow_builds_writes_false_for_review`
+        // but with a yaml on disk — the seed lands in the yaml, and
+        // the typed view picks it up via WorkspaceConfig.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("pnpm-workspace.yaml"),
+            "packages:\n  - 'p/*'\n",
+        )
+        .unwrap();
         add_to_allow_builds(dir.path(), &["esbuild".to_string()], false).unwrap();
         let config = WorkspaceConfig::load(dir.path()).unwrap();
         assert!(matches!(
@@ -1055,5 +1367,151 @@ updateConfig:
                 .map(|u| u.ignore_dependencies.as_slice()),
             Some(["is-odd".to_string()].as_slice())
         );
+    }
+
+    #[test]
+    fn upsert_workspace_patched_dependency_creates_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pnpm-workspace.yaml");
+        upsert_workspace_patched_dependency(
+            &path,
+            "is-positive@3.1.0",
+            "patches/is-positive@3.1.0.patch",
+        )
+        .unwrap();
+        let written = std::fs::read_to_string(&path).unwrap();
+        assert!(written.contains("patchedDependencies:"));
+        assert!(written.contains("is-positive@3.1.0"));
+        assert!(written.contains("patches/is-positive@3.1.0.patch"));
+    }
+
+    #[test]
+    fn upsert_workspace_patched_dependency_preserves_other_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pnpm-workspace.yaml");
+        std::fs::write(&path, "packages:\n  - 'pkgs/*'\noverrides:\n  foo: 1.0.0\n").unwrap();
+        upsert_workspace_patched_dependency(&path, "bar@2.0.0", "patches/bar@2.0.0.patch").unwrap();
+        let written = std::fs::read_to_string(&path).unwrap();
+        assert!(written.contains("packages:"));
+        assert!(written.contains("- 'pkgs/*'") || written.contains("- pkgs/*"));
+        assert!(written.contains("overrides:"));
+        assert!(written.contains("foo:"));
+        assert!(written.contains("patchedDependencies:"));
+        assert!(written.contains("bar@2.0.0"));
+    }
+
+    #[test]
+    fn remove_workspace_patched_dependency_drops_empty_map() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pnpm-workspace.yaml");
+        std::fs::write(
+            &path,
+            "patchedDependencies:\n  \"a@1.0.0\": patches/a@1.0.0.patch\n",
+        )
+        .unwrap();
+        let removed = remove_workspace_patched_dependency(&path, "a@1.0.0").unwrap();
+        assert!(removed);
+        let written = std::fs::read_to_string(&path).unwrap();
+        assert!(!written.contains("patchedDependencies"));
+    }
+
+    #[test]
+    fn remove_workspace_patched_dependency_missing_returns_false() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pnpm-workspace.yaml");
+        std::fs::write(
+            &path,
+            "patchedDependencies:\n  \"a@1.0.0\": patches/a@1.0.0.patch\n",
+        )
+        .unwrap();
+        let removed = remove_workspace_patched_dependency(&path, "missing@9.9.9").unwrap();
+        assert!(!removed);
+    }
+
+    #[test]
+    fn remove_workspace_patched_dependency_does_not_rewrite_when_key_absent() {
+        // yaml_serde's round-trip drops comments. `aube patch-remove`
+        // calls remove on both the workspace yaml and package.json
+        // regardless of where the patch lives, so a no-op remove must
+        // not touch the file (and lose the user's comments).
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pnpm-workspace.yaml");
+        let original = "# top-level comment\npatchedDependencies:\n  # patch annotation\n  \"a@1.0.0\": patches/a@1.0.0.patch\n";
+        std::fs::write(&path, original).unwrap();
+        let removed = remove_workspace_patched_dependency(&path, "missing@9.9.9").unwrap();
+        assert!(!removed);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+    }
+
+    #[test]
+    fn upsert_workspace_patched_dependency_does_not_rewrite_when_value_unchanged() {
+        // Same comment-preservation argument as the remove case: an
+        // idempotent re-record after editing the patch file should not
+        // strip yaml comments.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pnpm-workspace.yaml");
+        let original = "# top-level comment\npatchedDependencies:\n  # patch annotation\n  \"a@1.0.0\": patches/a@1.0.0.patch\n";
+        std::fs::write(&path, original).unwrap();
+        upsert_workspace_patched_dependency(&path, "a@1.0.0", "patches/a@1.0.0.patch").unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+    }
+
+    #[test]
+    fn add_to_allow_builds_does_not_rewrite_when_already_approved() {
+        // Re-approving an already-approved name must leave the file
+        // (and its yaml comments) untouched. `aube approve-builds` and
+        // the install-time auto-deny seed both call into this path on
+        // every invocation, so steady-state runs must not strip
+        // comments.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pnpm-workspace.yaml");
+        let original = "# why we trust this build\nallowBuilds:\n  # esbuild ships native bindings\n  esbuild: true\n";
+        std::fs::write(&path, original).unwrap();
+        let written = add_to_allow_builds(dir.path(), &["esbuild".to_string()], true).unwrap();
+        assert_eq!(written, path);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+    }
+
+    #[test]
+    fn add_to_allow_builds_does_not_rewrite_when_seeding_existing_review_entry() {
+        // The install-time review seed (`allowed=false`) should not
+        // overwrite a name that is already on the allow list — but
+        // also must not rewrite the file just to confirm that.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pnpm-workspace.yaml");
+        let original = "allowBuilds:\n  # already approved\n  esbuild: true\n";
+        std::fs::write(&path, original).unwrap();
+        add_to_allow_builds(dir.path(), &["esbuild".to_string()], false).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+    }
+
+    #[test]
+    fn edit_workspace_yaml_preserves_comments_on_no_op() {
+        // Direct test of the shared helper: a closure that doesn't
+        // mutate the parsed structure must leave the file byte-equal,
+        // including comments yaml_serde would otherwise strip.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pnpm-workspace.yaml");
+        let original = "# header comment\npackages:\n  # workspace globs\n  - 'pkgs/*'\n";
+        std::fs::write(&path, original).unwrap();
+        edit_workspace_yaml(&path, |_map| Ok(())).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+    }
+
+    #[test]
+    fn edit_workspace_yaml_writes_when_structure_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pnpm-workspace.yaml");
+        std::fs::write(&path, "packages:\n  - 'pkgs/*'\n").unwrap();
+        edit_workspace_yaml(&path, |map| {
+            map.insert(
+                yaml_serde::Value::String("foo".to_string()),
+                yaml_serde::Value::String("bar".to_string()),
+            );
+            Ok(())
+        })
+        .unwrap();
+        let written = std::fs::read_to_string(&path).unwrap();
+        assert!(written.contains("foo: bar"));
     }
 }

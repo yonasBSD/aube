@@ -150,31 +150,75 @@ pub fn load_patches(cwd: &Path) -> Result<BTreeMap<String, ResolvedPatch>> {
     Ok(out)
 }
 
-/// Add or replace an entry in `pnpm.patchedDependencies`, preserving
-/// the rest of `package.json`. Writes the file back with a trailing
-/// newline.
-pub fn upsert_patched_dependency(cwd: &Path, key: &str, rel_patch_path: &str) -> Result<()> {
-    edit_patched_dependencies(cwd, |map| {
-        map.insert(
-            key.to_string(),
-            serde_json::Value::String(rel_patch_path.to_string()),
-        );
-    })
+/// Add or replace an entry in `patchedDependencies`. Routes through
+/// the shared [`aube_manifest::workspace::config_write_target`] rule:
+/// workspace yaml when one is present, otherwise `package.json`.
+/// Returns the path that was rewritten so the caller can report it to
+/// the user.
+pub fn upsert_patched_dependency(cwd: &Path, key: &str, rel_patch_path: &str) -> Result<PathBuf> {
+    use aube_manifest::workspace::ConfigWriteTarget;
+    match aube_manifest::workspace::config_write_target(cwd) {
+        ConfigWriteTarget::PackageJson => {
+            aube_manifest::workspace::edit_setting_map(cwd, "patchedDependencies", |map| {
+                map.insert(
+                    key.to_string(),
+                    serde_json::Value::String(rel_patch_path.to_string()),
+                );
+            })
+            .map_err(miette::Report::new)
+            .wrap_err("failed to write package.json")?;
+            Ok(cwd.join("package.json"))
+        }
+        ConfigWriteTarget::WorkspaceYaml(path) => {
+            aube_manifest::workspace::upsert_workspace_patched_dependency(
+                &path,
+                key,
+                rel_patch_path,
+            )
+            .map_err(miette::Report::new)
+            .wrap_err_with(|| format!("failed to write {}", path.display()))?;
+            Ok(path)
+        }
+    }
 }
 
-/// Drop an entry from `pnpm.patchedDependencies`. Returns `true` if
-/// the entry existed.
-pub fn remove_patched_dependency(cwd: &Path, key: &str) -> Result<bool> {
-    let mut existed = false;
-    edit_patched_dependencies(cwd, |map| {
-        existed = map.remove(key).is_some();
-    })?;
-    Ok(existed)
+/// Drop an entry from `patchedDependencies` in whichever file declares
+/// it (workspace yaml, `package.json#pnpm.patchedDependencies`,
+/// `package.json#aube.patchedDependencies`, or any combination).
+/// Returns the files that were rewritten — empty when no location held
+/// the entry. Each side peeks before rewriting so the no-op case
+/// leaves the file (and any user yaml comments) intact.
+pub fn remove_patched_dependency(cwd: &Path, key: &str) -> Result<Vec<PathBuf>> {
+    let mut rewritten = Vec::new();
+    if let Some(ws_path) = aube_manifest::workspace::workspace_yaml_existing(cwd)
+        && aube_manifest::workspace::remove_workspace_patched_dependency(&ws_path, key)
+            .map_err(miette::Report::new)
+            .wrap_err_with(|| format!("failed to write {}", ws_path.display()))?
+    {
+        rewritten.push(ws_path);
+    }
+    if aube_manifest::workspace::remove_setting_entry(cwd, "patchedDependencies", key)
+        .map_err(miette::Report::new)
+        .wrap_err("failed to write package.json")?
+    {
+        rewritten.push(cwd.join("package.json"));
+    }
+    Ok(rewritten)
 }
 
-/// Read the current `pnpm.patchedDependencies` map from
-/// `package.json`. Returns an empty map if the field is absent.
+/// Read every declared `patchedDependencies` entry across both the
+/// workspace yaml and `package.json`, with workspace-yaml entries
+/// winning on key conflict (same precedence used by `load_patches`).
 pub fn read_patched_dependencies(cwd: &Path) -> Result<BTreeMap<String, String>> {
+    let mut out = read_package_json_patched_dependencies(cwd)?;
+    let ws_config = aube_manifest::workspace::WorkspaceConfig::load(cwd)
+        .map_err(miette::Report::new)
+        .wrap_err("failed to read workspace yaml")?;
+    out.extend(ws_config.patched_dependencies);
+    Ok(out)
+}
+
+fn read_package_json_patched_dependencies(cwd: &Path) -> Result<BTreeMap<String, String>> {
     let manifest_path = cwd.join("package.json");
     if !manifest_path.exists() {
         return Ok(BTreeMap::new());
@@ -183,61 +227,6 @@ pub fn read_patched_dependencies(cwd: &Path) -> Result<BTreeMap<String, String>>
         .map_err(miette::Report::new)
         .wrap_err("failed to read package.json")?;
     Ok(manifest.pnpm_patched_dependencies())
-}
-
-/// Read `package.json` as a generic `Value`, run `f` on the
-/// `pnpm.patchedDependencies` object (creating it if needed), and
-/// write the file back. Using a raw `Value` round-trip rather than
-/// the typed `PackageJson` keeps unrelated keys, ordering, and
-/// serialization details intact.
-fn edit_patched_dependencies<F>(cwd: &Path, f: F) -> Result<()>
-where
-    F: FnOnce(&mut serde_json::Map<String, serde_json::Value>),
-{
-    let manifest_path = cwd.join("package.json");
-    let raw = std::fs::read_to_string(&manifest_path)
-        .into_diagnostic()
-        .map_err(|e| miette!("failed to read package.json: {e}"))?;
-    let mut value = aube_manifest::parse_json::<serde_json::Value>(&manifest_path, raw)
-        .map_err(miette::Report::new)
-        .wrap_err("failed to parse package.json")?;
-
-    let obj = value
-        .as_object_mut()
-        .ok_or_else(|| miette!("package.json is not an object"))?;
-    let pnpm = obj
-        .entry("pnpm".to_string())
-        .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
-    let pnpm_obj = pnpm
-        .as_object_mut()
-        .ok_or_else(|| miette!("`pnpm` field in package.json is not an object"))?;
-    let patched = pnpm_obj
-        .entry("patchedDependencies".to_string())
-        .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
-    let patched_obj = patched
-        .as_object_mut()
-        .ok_or_else(|| miette!("`pnpm.patchedDependencies` is not an object"))?;
-
-    f(patched_obj);
-
-    // If the user removed the last patch, drop the now-empty
-    // `patchedDependencies` (and `pnpm` itself when it's empty too)
-    // so we don't leave noise in the manifest.
-    if patched_obj.is_empty() {
-        pnpm_obj.remove("patchedDependencies");
-    }
-    if pnpm_obj.is_empty() {
-        obj.remove("pnpm");
-    }
-
-    let mut out = serde_json::to_string_pretty(&value)
-        .into_diagnostic()
-        .map_err(|e| miette!("failed to serialize package.json: {e}"))?;
-    out.push('\n');
-    std::fs::write(&manifest_path, out)
-        .into_diagnostic()
-        .map_err(|e| miette!("failed to write package.json: {e}"))?;
-    Ok(())
 }
 
 /// Recursively copy `src` into `dst`, following file content but
@@ -300,5 +289,131 @@ mod tests {
     fn split_missing_version_errors() {
         assert!(split_patch_key("is-positive").is_err());
         assert!(split_patch_key("@babel/core").is_err());
+    }
+
+    #[test]
+    fn upsert_writes_to_yaml_when_one_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("package.json"), "{}\n").unwrap();
+        std::fs::write(
+            dir.path().join("pnpm-workspace.yaml"),
+            "packages:\n  - 'pkgs/*'\n",
+        )
+        .unwrap();
+        let written =
+            upsert_patched_dependency(dir.path(), "a@1.0.0", "patches/a@1.0.0.patch").unwrap();
+        assert_eq!(written, dir.path().join("pnpm-workspace.yaml"));
+    }
+
+    #[test]
+    fn upsert_writes_to_package_json_when_no_yaml() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("package.json"), "{}\n").unwrap();
+        let written =
+            upsert_patched_dependency(dir.path(), "a@1.0.0", "patches/a@1.0.0.patch").unwrap();
+        assert_eq!(written, dir.path().join("package.json"));
+    }
+
+    #[test]
+    fn upsert_writes_to_aube_namespace_when_no_pnpm_in_manifest() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("package.json"), "{}\n").unwrap();
+        upsert_patched_dependency(dir.path(), "a@1.0.0", "patches/a@1.0.0.patch").unwrap();
+        let manifest = std::fs::read_to_string(dir.path().join("package.json")).unwrap();
+        assert!(
+            manifest.contains("\"aube\""),
+            "expected aube namespace, got:\n{manifest}"
+        );
+        assert!(
+            !manifest.contains("\"pnpm\""),
+            "should not introduce pnpm namespace, got:\n{manifest}"
+        );
+        assert!(manifest.contains("\"patchedDependencies\""));
+    }
+
+    #[test]
+    fn upsert_collapses_shadow_when_other_namespace_holds_stale_entry() {
+        // A pnpm-aware tool can add a `pnpm` namespace after aube has
+        // already populated `aube.patchedDependencies`. Without the
+        // merge-and-collapse below, the next `aube patch-commit` would
+        // write to `pnpm.patchedDependencies` while the stale
+        // `aube.patchedDependencies.<key>` entry shadowed it on read
+        // (aube.* wins on conflict). Pin the post-write invariant:
+        // exactly one namespace holds the entry.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("package.json"),
+            "{\"aube\":{\"patchedDependencies\":{\"a@1.0.0\":\"patches/old.patch\"}},\"pnpm\":{\"someKey\":1}}\n",
+        )
+        .unwrap();
+        upsert_patched_dependency(dir.path(), "a@1.0.0", "patches/new.patch").unwrap();
+        let raw = std::fs::read_to_string(dir.path().join("package.json")).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        // Entry migrated to pnpm.patchedDependencies, with the new value.
+        assert_eq!(
+            parsed["pnpm"]["patchedDependencies"]["a@1.0.0"],
+            "patches/new.patch"
+        );
+        // Stale aube.patchedDependencies entry is gone — no shadow.
+        assert!(parsed["aube"]["patchedDependencies"].is_null());
+        // The user's other pnpm config is preserved.
+        assert_eq!(parsed["pnpm"]["someKey"], 1);
+    }
+
+    #[test]
+    fn upsert_writes_to_pnpm_namespace_when_pnpm_already_present() {
+        let dir = tempfile::tempdir().unwrap();
+        // User already has a pnpm-namespaced setting (allowBuilds);
+        // a new patch should land in the same pnpm bucket so we don't
+        // fragment their config across two namespaces.
+        std::fs::write(
+            dir.path().join("package.json"),
+            "{\"pnpm\":{\"allowBuilds\":{\"esbuild\":true}}}\n",
+        )
+        .unwrap();
+        upsert_patched_dependency(dir.path(), "a@1.0.0", "patches/a@1.0.0.patch").unwrap();
+        let manifest = std::fs::read_to_string(dir.path().join("package.json")).unwrap();
+        assert!(manifest.contains("\"pnpm\""));
+        assert!(
+            !manifest.contains("\"aube\""),
+            "should not introduce aube namespace alongside pnpm: {manifest}"
+        );
+        // The patch entry must be inside pnpm.
+        let parsed: serde_json::Value = serde_json::from_str(&manifest).unwrap();
+        assert!(parsed["pnpm"]["patchedDependencies"]["a@1.0.0"].is_string());
+    }
+
+    #[test]
+    fn remove_returns_each_rewritten_file() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("package.json"),
+            "{\"pnpm\":{\"patchedDependencies\":{\"a@1.0.0\":\"patches/a@1.0.0.patch\"}}}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("pnpm-workspace.yaml"),
+            "patchedDependencies:\n  \"a@1.0.0\": patches/a@1.0.0.patch\n",
+        )
+        .unwrap();
+        let rewritten = remove_patched_dependency(dir.path(), "a@1.0.0").unwrap();
+        let names: Vec<String> = rewritten
+            .iter()
+            .filter_map(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+            .collect();
+        assert_eq!(names, vec!["pnpm-workspace.yaml", "package.json"]);
+    }
+
+    #[test]
+    fn remove_returns_empty_when_neither_file_holds_key() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("package.json"), "{}\n").unwrap();
+        std::fs::write(
+            dir.path().join("pnpm-workspace.yaml"),
+            "packages:\n  - 'pkgs/*'\n",
+        )
+        .unwrap();
+        let rewritten = remove_patched_dependency(dir.path(), "missing@9.9.9").unwrap();
+        assert!(rewritten.is_empty());
     }
 }
