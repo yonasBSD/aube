@@ -77,6 +77,12 @@ pub struct InstallArgs {
     /// Skip lifecycle scripts (no-op; aube already skips by default)
     #[arg(long)]
     pub ignore_scripts: bool,
+    /// Read and write the lockfile in the given directory instead of
+    /// alongside `package.json`. The project becomes an importer
+    /// keyed by its relative path from the lockfile directory.
+    /// Mirrors pnpm's `--lockfile-dir`.
+    #[arg(long, value_name = "PATH")]
+    pub lockfile_dir: Option<String>,
     /// Resolve dependencies and write the lockfile, but don't link
     /// `node_modules`.
     ///
@@ -203,6 +209,9 @@ impl InstallArgs {
         }
         if let Some(linker) = self.node_linker.as_deref() {
             out.push(("node-linker".to_string(), linker.to_string()));
+        }
+        if let Some(d) = self.lockfile_dir.as_deref() {
+            out.push(("lockfile-dir".to_string(), d.to_string()));
         }
         if let Some(method) = self.package_import_method.as_deref() {
             out.push(("package-import-method".to_string(), method.to_string()));
@@ -1357,6 +1366,85 @@ pub async fn run(opts: InstallOptions) -> miette::Result<()> {
     };
     super::configure_script_settings(&settings_ctx);
 
+    // `--lockfile-dir` / `lockfileDir`: relocate `aube-lock.yaml` to a
+    // different directory than the project root. The project becomes
+    // an importer keyed by its relative path from the lockfile dir.
+    // Defaults to the project root → importer key `.` → back-compat
+    // with every existing install. Multi-project shared lockfiles
+    // (`pnpm-workspace.yaml`, `sharedWorkspaceLockfile`) are out of
+    // scope here — see the read-side guard in
+    // `parse_lockfile_dir_remapped`.
+    //
+    // Relative paths resolve against the project root, not cwd
+    // (pnpm convention). Both sides are canonicalized so equality and
+    // `pathdiff` work regardless of symlinks or `./project/..` style
+    // inputs (`cwd` itself originates from `find_project_root`, which
+    // doesn't canonicalize).
+    let (lockfile_dir, lockfile_importer_key): (std::path::PathBuf, String) =
+        match aube_settings::resolved::lockfile_dir(&settings_ctx) {
+            Some(raw) => {
+                let raw_path = std::path::Path::new(&raw);
+                let resolved = if raw_path.is_absolute() {
+                    raw_path.to_path_buf()
+                } else {
+                    cwd.join(raw_path)
+                };
+                // pnpm creates the lockfile directory on demand; mirror that
+                // so users can point at a not-yet-materialized shared dir.
+                std::fs::create_dir_all(&resolved)
+                    .into_diagnostic()
+                    .wrap_err_with(|| format!("--lockfile-dir: {}", resolved.display()))?;
+                let canon = std::fs::canonicalize(&resolved)
+                    .into_diagnostic()
+                    .wrap_err_with(|| format!("--lockfile-dir: {}", resolved.display()))?;
+                let canon_cwd = std::fs::canonicalize(&cwd).into_diagnostic()?;
+                if canon == canon_cwd {
+                    (cwd.clone(), ".".to_string())
+                } else {
+                    let key = pathdiff::diff_paths(&canon_cwd, &canon)
+                        .map(|p| {
+                            // Lockfile importer keys use forward slashes on every
+                            // platform so committed lockfiles stay portable across
+                            // Windows ↔ Unix CI.
+                            let s = p.to_string_lossy().into_owned();
+                            if std::path::MAIN_SEPARATOR == '/' {
+                                s
+                            } else {
+                                s.replace(std::path::MAIN_SEPARATOR, "/")
+                            }
+                        })
+                        .ok_or_else(|| {
+                            miette!(
+                                "lockfile-dir {} cannot be related to project {}",
+                                canon.display(),
+                                canon_cwd.display()
+                            )
+                        })?;
+                    (canon, key)
+                }
+            }
+            None => (cwd.clone(), ".".to_string()),
+        };
+
+    // Fail fast on multi-project shared lockfiles (see
+    // `guard_against_foreign_importers`). The downstream lockfile-read
+    // sites only fire on `Fix`/`Prefer`/`--lockfile-only` paths, so a
+    // `--no-frozen-lockfile` install pointed at someone else's lockfile
+    // dir would silently overwrite their entries — this guard moves
+    // the check ahead of the resolver so it fires regardless of
+    // FrozenMode. `NotFound` means we're the first project writing
+    // here; that's exactly the supported case.
+    if lockfile_importer_key != "." {
+        match aube_lockfile::parse_lockfile(&lockfile_dir, &manifest) {
+            Ok(graph) => {
+                guard_against_foreign_importers(&lockfile_dir, &lockfile_importer_key, &graph)
+                    .map_err(miette::Report::new)?;
+            }
+            Err(aube_lockfile::Error::NotFound(_)) => {}
+            Err(e) => return Err(miette::Report::new(e)).wrap_err("failed to parse lockfile"),
+        }
+    }
+
     // `modulesDir` controls the project-level directory name that
     // holds the top-level `<name>` entries. Defaults to
     // `"node_modules"` — Node's own module resolution algorithm still
@@ -1748,7 +1836,7 @@ pub async fn run(opts: InstallOptions) -> miette::Result<()> {
     // `lockfile=false` — no lockfile is read and no format is
     // preserved, so the install always writes nothing (see below).
     let source_kind_before = if lockfile_enabled {
-        aube_lockfile::detect_existing_lockfile_kind(&cwd)
+        aube_lockfile::detect_existing_lockfile_kind(&lockfile_dir)
     } else {
         None
     };
@@ -1786,7 +1874,11 @@ pub async fn run(opts: InstallOptions) -> miette::Result<()> {
     // the lockfile is absent, which the downstream arms already handle.
     let lockfile_pre_parse: Option<(aube_lockfile::LockfileGraph, aube_lockfile::LockfileKind)> =
         if lockfile_enabled && matches!(mode, FrozenMode::Fix | FrozenMode::Prefer) {
-            match aube_lockfile::parse_lockfile_with_kind(&cwd, &manifest) {
+            match parse_lockfile_dir_remapped_with_kind(
+                &lockfile_dir,
+                &lockfile_importer_key,
+                &manifest,
+            ) {
                 Ok(parsed) => Some(parsed),
                 Err(aube_lockfile::Error::NotFound(_)) => None,
                 Err(e) => {
@@ -1826,7 +1918,11 @@ pub async fn run(opts: InstallOptions) -> miette::Result<()> {
         > = if let Some((g, k)) = lockfile_pre_parse.as_ref() {
             Ok((g, *k))
         } else {
-            parsed_owned = aube_lockfile::parse_lockfile_with_kind(&cwd, &manifest);
+            parsed_owned = parse_lockfile_dir_remapped_with_kind(
+                &lockfile_dir,
+                &lockfile_importer_key,
+                &manifest,
+            );
             match &parsed_owned {
                 Ok((g, k)) => Ok((g, *k)),
                 Err(e) => Err(e),
@@ -1842,7 +1938,11 @@ pub async fn run(opts: InstallOptions) -> miette::Result<()> {
             // about to abort anyway so speed does not matter here.
             // What matters: keeping the source span and miette help
             // text instead of flattening to one line via `{e}`.
-            match aube_lockfile::parse_lockfile_with_kind(&cwd, &manifest) {
+            match parse_lockfile_dir_remapped_with_kind(
+                &lockfile_dir,
+                &lockfile_importer_key,
+                &manifest,
+            ) {
                 Ok(_) => {
                     // Race: second parse succeeded while first failed.
                     // Surface the observed error text as a best
@@ -1946,10 +2046,15 @@ pub async fn run(opts: InstallOptions) -> miette::Result<()> {
         }
         let lo_write_kind = source_kind_before.unwrap_or(aube_lockfile::LockfileKind::Aube);
         if shared_workspace_lockfile || !has_workspace {
-            let lo_written =
-                aube_lockfile::write_lockfile_as(&cwd, &graph, &manifest, lo_write_kind)
-                    .into_diagnostic()
-                    .wrap_err("failed to write lockfile")?;
+            let lo_written = write_lockfile_dir_remapped(
+                &lockfile_dir,
+                &lockfile_importer_key,
+                &graph,
+                &manifest,
+                lo_write_kind,
+            )
+            .into_diagnostic()
+            .wrap_err("failed to write lockfile")?;
             tracing::debug!(
                 "--lockfile-only: wrote {}",
                 lo_written
@@ -2082,7 +2187,11 @@ pub async fn run(opts: InstallOptions) -> miette::Result<()> {
             }
             FrozenMode::Frozen => {
                 // Use the lockfile, but error out on any drift across all workspace importers.
-                let parsed = aube_lockfile::parse_lockfile_with_kind(&cwd, &manifest);
+                let parsed = parse_lockfile_dir_remapped_with_kind(
+                    &lockfile_dir,
+                    &lockfile_importer_key,
+                    &manifest,
+                );
                 if let Ok((ref graph, _)) = parsed {
                     if let DriftStatus::Stale { reason } =
                         graph.check_catalogs_drift(&workspace_catalogs)
@@ -2644,7 +2753,9 @@ pub async fn run(opts: InstallOptions) -> miette::Result<()> {
             // on every re-resolve even though the resolved versions
             // didn't change, which churns the lockfile diff against
             // formats (npm, bun) that preserve them.
-            if let Ok(prior) = aube_lockfile::parse_lockfile(&cwd, &manifest) {
+            if let Ok(prior) =
+                parse_lockfile_dir_remapped(&lockfile_dir, &lockfile_importer_key, &manifest)
+            {
                 graph.overlay_metadata_from(&prior);
             }
             tracing::debug!("Resolved {} packages", graph.packages.len());
@@ -2927,10 +3038,15 @@ pub async fn run(opts: InstallOptions) -> miette::Result<()> {
                 }
                 let write_kind = source_kind_before.unwrap_or(aube_lockfile::LockfileKind::Aube);
                 if shared_workspace_lockfile || !has_workspace {
-                    let written_path =
-                        aube_lockfile::write_lockfile_as(&cwd, &graph, &manifest, write_kind)
-                            .into_diagnostic()
-                            .wrap_err("failed to write lockfile")?;
+                    let written_path = write_lockfile_dir_remapped(
+                        &lockfile_dir,
+                        &lockfile_importer_key,
+                        &graph,
+                        &manifest,
+                        write_kind,
+                    )
+                    .into_diagnostic()
+                    .wrap_err("failed to write lockfile")?;
                     // Log the basename (matches the format resolve.bats and
                     // similar tests assert against — e.g. "Wrote aube-lock.yaml").
                     tracing::debug!(
@@ -3882,6 +3998,101 @@ fn package_name_from_spec_key(spec: &str) -> String {
     spec.split_once('@')
         .map(|(name, _)| name.to_string())
         .unwrap_or_else(|| spec.to_string())
+}
+
+/// Read a lockfile from `lockfile_dir` and remap its importer key
+/// for the current project from the project's relative-path key to
+/// `"."`, so the rest of the install pipeline can keep treating the
+/// project as the root importer. No-op when `importer_key == "."`.
+fn parse_lockfile_dir_remapped(
+    lockfile_dir: &std::path::Path,
+    importer_key: &str,
+    manifest: &aube_manifest::PackageJson,
+) -> Result<aube_lockfile::LockfileGraph, aube_lockfile::Error> {
+    let mut graph = aube_lockfile::parse_lockfile(lockfile_dir, manifest)?;
+    if importer_key != "."
+        && let Some(deps) = graph.importers.remove(importer_key)
+    {
+        graph.importers.insert(".".to_string(), deps);
+    }
+    Ok(graph)
+}
+
+/// Same as [`parse_lockfile_dir_remapped`] but preserves the detected
+/// kind for callers that need format-aware behavior.
+fn parse_lockfile_dir_remapped_with_kind(
+    lockfile_dir: &std::path::Path,
+    importer_key: &str,
+    manifest: &aube_manifest::PackageJson,
+) -> Result<(aube_lockfile::LockfileGraph, aube_lockfile::LockfileKind), aube_lockfile::Error> {
+    let (mut graph, kind) = aube_lockfile::parse_lockfile_with_kind(lockfile_dir, manifest)?;
+    if importer_key != "."
+        && let Some(deps) = graph.importers.remove(importer_key)
+    {
+        graph.importers.insert(".".to_string(), deps);
+    }
+    Ok((graph, kind))
+}
+
+/// Refuse to operate on a `--lockfile-dir` lockfile that already
+/// records other importers besides the current project. This PR
+/// scopes `--lockfile-dir` to single-project relocation; multi-
+/// project shared lockfiles need workspace coordination (resolve
+/// every importer's deps in one pass, prune packages by union of all
+/// importers) which is out of scope. Without this guard, a second
+/// project pointed at the same dir would silently orphan-strip the
+/// first project's package entries on the next install. Loud-fail
+/// here so the user can move to a workspace setup or pick a
+/// different `lockfileDir`.
+fn guard_against_foreign_importers(
+    lockfile_dir: &std::path::Path,
+    importer_key: &str,
+    graph: &aube_lockfile::LockfileGraph,
+) -> Result<(), aube_lockfile::Error> {
+    let foreign: Vec<&str> = graph
+        .importers
+        .keys()
+        .map(String::as_str)
+        .filter(|k| *k != "." && *k != importer_key)
+        .collect();
+    if foreign.is_empty() {
+        return Ok(());
+    }
+    Err(aube_lockfile::Error::Parse(
+        lockfile_dir.to_path_buf(),
+        format!(
+            "lockfile already records importers from other projects ({}); \
+             aube does not yet support multi-project shared lockfiles outside a workspace. \
+             Use a `pnpm-workspace.yaml` workspace, or point each project at its own `--lockfile-dir`.",
+            foreign.join(", ")
+        ),
+    ))
+}
+
+/// Write `graph` to `lockfile_dir`, remapping the project's `"."`
+/// importer key to its relative-path key from `lockfile_dir`.
+/// No-op remap when `importer_key == "."`.
+fn write_lockfile_dir_remapped(
+    lockfile_dir: &std::path::Path,
+    importer_key: &str,
+    graph: &aube_lockfile::LockfileGraph,
+    manifest: &aube_manifest::PackageJson,
+    kind: aube_lockfile::LockfileKind,
+) -> Result<std::path::PathBuf, aube_lockfile::Error> {
+    if importer_key == "." {
+        return aube_lockfile::write_lockfile_as(lockfile_dir, graph, manifest, kind);
+    }
+    let mut remapped = graph.clone();
+    let deps = remapped.importers.remove(".").ok_or_else(|| {
+        aube_lockfile::Error::Parse(
+            lockfile_dir.to_path_buf(),
+            format!(
+                "in-memory lockfile graph missing `.` importer; cannot write under key `{importer_key}`"
+            ),
+        )
+    })?;
+    remapped.importers.insert(importer_key.to_string(), deps);
+    aube_lockfile::write_lockfile_as(lockfile_dir, &remapped, manifest, kind)
 }
 
 fn print_already_up_to_date() {
