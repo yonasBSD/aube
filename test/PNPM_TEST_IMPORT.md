@@ -48,8 +48,8 @@ Goal: highest install-path parity coverage for lowest cost. Each row is a pnpm s
   - Documented divergences (don't port without aube-side fix): readPackage returning undefined fails install (68), readPackage on root project's manifest applies (551).
 - [ ] `pnpm/test/install/lifecycleScripts.ts` (21 tests, 356 LOC) → fold into [test/lifecycle_scripts.bats](lifecycle_scripts.bats)
   - pre/postinstall ordering, exit-code propagation, env-var inheritance, script-not-found handling
-- [ ] `pnpm/test/saveCatalog.ts` (8 tests, 224 LOC) → fold into [test/catalogs.bats](catalogs.bats)
-  - catalog protocol save semantics, named catalogs, catalog: + workspace: interaction
+- [x] `pnpm/test/saveCatalog.ts` (8 tests, 224 LOC) → [test/pnpm_savecatalog.bats](pnpm_savecatalog.bats) (8/8 ported)
+  - Implements `aube add --save-catalog` and `--save-catalog-name=<name>`, `<pkg>@workspace:*` CLI parsing for `aube add`, and `sharedWorkspaceLockfile=false` per-project lockfile writes.
 
 ## Phase 2 — depends on add_dist_tag helper
 
