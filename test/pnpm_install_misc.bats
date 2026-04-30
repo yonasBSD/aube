@@ -154,6 +154,53 @@ JSON
 	assert_output --partial "Hello world!"
 }
 
+@test "aube add: a top-level bin can require a sibling top-level package" {
+	# Ported from pnpm/test/install/misc.ts:190 ('top-level packages should
+	# find the plugins they use'). Uses the @pnpm.e2e/pkg-that-uses-plugins
+	# and @pnpm.e2e/plugin-example fixtures from test/registry/storage/.
+	# pnpm runs `npm test`; we use `aube run test` to keep the assertion
+	# purely about aube's resolution wiring for top-level deps.
+	cat >package.json <<'JSON'
+{
+  "name": "pnpm-misc-top-level-plugins",
+  "version": "1.0.0",
+  "scripts": { "test": "pkg-that-uses-plugins" }
+}
+JSON
+
+	run aube add @pnpm.e2e/pkg-that-uses-plugins @pnpm.e2e/plugin-example
+	assert_success
+
+	run aube run test
+	assert_success
+	assert_output --partial "My plugin is @pnpm.e2e/plugin-example"
+}
+
+@test "aube add: a top-level dep's bin can require its own (non-top-level) dep" {
+	# Ported from pnpm/test/install/misc.ts:204 ('not top-level packages
+	# should find the plugins they use'). pnpm uses `standard@8.6.0` which
+	# pulls in ~170 transitive deps; we substitute a minimal fixture
+	# (aube-test-bin-uses-dep) whose bin requires @pnpm.e2e/dep-of-pkg-with-1-dep,
+	# its declared regular dep that is NOT a top-level dep of the test
+	# project. This exercises the same property: a top-level dep's bin
+	# can resolve its own non-top-level deps via Node's parent-`node_modules`
+	# walk under aube's isolated layout.
+	cat >package.json <<'JSON'
+{
+  "name": "pnpm-misc-not-top-level-plugins",
+  "version": "1.0.0",
+  "scripts": { "test": "aube-bin-uses-dep" }
+}
+JSON
+
+	run aube add aube-test-bin-uses-dep
+	assert_success
+
+	run aube run test
+	assert_success
+	assert_output --partial "Loaded inner dep: @pnpm.e2e/dep-of-pkg-with-1-dep"
+}
+
 @test "aube add: creates package.json if there is none" {
 	# Ported from pnpm/test/install/misc.ts:233 ('create a package.json
 	# if there is none'). pnpm `install <pkg>` ≈ aube `add <pkg>`.
