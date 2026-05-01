@@ -59,9 +59,25 @@ pub fn all() -> &'static [SettingMeta] {
     SETTINGS
 }
 
-/// Look up a setting by its canonical pnpm name.
+/// Look up a setting by its canonical pnpm name. `SETTINGS` is
+/// generated sorted by name (build.rs guarantees this via
+/// `BTreeMap` iteration), so a binary search drops the lookup from
+/// O(N) to O(log N). With ~120 entries and dozens of lookups per
+/// command, the saving compounds across every `aube run` startup.
+///
+/// The sort invariant is asserted in debug builds. A future hand
+/// edit of `SETTINGS` (or a regression in the build.rs sort) would
+/// silently flip valid lookups to `None`; the assert catches that
+/// in test runs without slowing release builds.
 pub fn find(name: &str) -> Option<&'static SettingMeta> {
-    SETTINGS.iter().find(|s| s.name == name)
+    debug_assert!(
+        SETTINGS.windows(2).all(|w| w[0].name <= w[1].name),
+        "SETTINGS must be sorted by name for find() to work"
+    );
+    SETTINGS
+        .binary_search_by(|s| s.name.cmp(name))
+        .ok()
+        .map(|i| &SETTINGS[i])
 }
 
 #[cfg(test)]

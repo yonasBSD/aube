@@ -76,6 +76,73 @@ pub fn atomic_write(final_path: &Path, bytes: &[u8]) -> io::Result<()> {
     }
 }
 
+/// Outcome of a `write_excl` attempt. `Created` means our bytes
+/// committed at the final path. `AlreadyExists` means another writer
+/// (or a prior process) committed first; for content-addressed
+/// stores this is a success path because the existing bytes are
+/// bit-identical by construction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WriteOutcome {
+    Created,
+    AlreadyExists,
+}
+
+/// Direct `O_CREAT|O_EXCL|O_WRONLY` write to a final path. Skips the
+/// tempfile + rename dance for content-addressed paths where racing
+/// writers produce bit-identical content.
+///
+/// Creates parent directories on demand. On `EEXIST`, returns
+/// `AlreadyExists` rather than erroring — the caller decides whether
+/// that's a success (CAS) or a real error (other layouts).
+///
+/// Sets POSIX mode via `set_permissions` while the file is still
+/// open. Windows inherits ACLs; the `mode` argument is ignored
+/// there.
+pub fn write_excl(path: &Path, bytes: &[u8], mode: Option<u32>) -> io::Result<WriteOutcome> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    let mut file = match opts.open(path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+            return Ok(WriteOutcome::AlreadyExists);
+        }
+        Err(e) => return Err(e),
+    };
+    // On any failure after the file exists, best-effort unlink so we
+    // don't leave a partial / mode-incorrect entry at the final
+    // path. The previous `tempfile + persist_noclobber` shape got
+    // this for free (drop unlinks the temp); the direct-write shape
+    // has to do it explicitly. Unlink errors are ignored — the
+    // primary error wins.
+    let cleanup_on_err = |path: &Path, e: io::Error| -> io::Error {
+        let _ = std::fs::remove_file(path);
+        e
+    };
+    {
+        use std::io::Write as _;
+        if let Err(e) = file.write_all(bytes) {
+            return Err(cleanup_on_err(path, e));
+        }
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        if let Some(m) = mode
+            && let Err(e) = file.set_permissions(std::fs::Permissions::from_mode(m))
+        {
+            return Err(cleanup_on_err(path, e));
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = mode;
+    }
+    Ok(WriteOutcome::Created)
+}
+
 pub mod sentinel {
     use super::*;
 

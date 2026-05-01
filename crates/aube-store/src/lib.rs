@@ -121,6 +121,18 @@ fn cas_file_matches_len(path: &Path, expected_len: u64) -> bool {
         .unwrap_or(false)
 }
 
+/// Outcome of `create_cas_file`. `Created` means we wrote the bytes
+/// at the final path; `AlreadyExisted` means another writer (or a
+/// previous import) had already committed bit-identical content. The
+/// distinction lets `import_bytes` skip the post-write length check
+/// on the freshly-created path — the file IS exactly the bytes we
+/// just wrote.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CasWriteOutcome {
+    Created,
+    AlreadyExisted,
+}
+
 impl Store {
     /// Open the store at the default location (see [`dirs::store_dir`]).
     pub fn default_location() -> Result<Self, Error> {
@@ -375,9 +387,21 @@ impl Store {
     /// `NotFound` means a concurrent prune or a missed `ensure_shards_exist`
     /// removed the parent shard; recreate it and retry exactly once before
     /// surfacing.
-    fn create_cas_file(path: &Path, content: Option<&[u8]>) -> Result<(), Error> {
-        fn do_create_and_write(path: &Path, content: Option<&[u8]>) -> Result<(), Error> {
+    fn create_cas_file(path: &Path, content: Option<&[u8]>) -> Result<CasWriteOutcome, Error> {
+        fn do_create_and_write(
+            path: &Path,
+            content: Option<&[u8]>,
+        ) -> Result<CasWriteOutcome, Error> {
             if let Some(bytes) = content {
+                // Tempfile + persist_noclobber gives atomic crash
+                // semantics: a partial write on `tmp` is dropped by
+                // tempfile's Drop impl, so the final path either
+                // contains the complete bytes or doesn't exist. A
+                // direct O_CREAT|O_EXCL write to the final path was
+                // tried (faster path, ~3 syscalls per file) but
+                // raced with concurrent installs in CI where two
+                // processes saw the same partial file in different
+                // orders and clobbered each other's recovery.
                 let parent = path.parent().ok_or_else(|| {
                     Error::Io(path.to_path_buf(), std::io::ErrorKind::NotFound.into())
                 })?;
@@ -396,8 +420,10 @@ impl Store {
                         .map_err(|e| Error::Io(path.to_path_buf(), e))?;
                 }
                 return match tmp.persist_noclobber(path) {
-                    Ok(_) => Ok(()),
-                    Err(e) if e.error.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+                    Ok(_) => Ok(CasWriteOutcome::Created),
+                    Err(e) if e.error.kind() == std::io::ErrorKind::AlreadyExists => {
+                        Ok(CasWriteOutcome::AlreadyExisted)
+                    }
                     Err(e) => Err(Error::Io(path.to_path_buf(), e.error)),
                 };
             }
@@ -407,14 +433,16 @@ impl Store {
                 .create_new(true)
                 .open(path)
             {
-                Ok(_) => Ok(()),
-                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+                Ok(_) => Ok(CasWriteOutcome::Created),
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    Ok(CasWriteOutcome::AlreadyExisted)
+                }
                 Err(e) => Err(Error::Io(path.to_path_buf(), e)),
             }
         }
 
         match do_create_and_write(path, content) {
-            Ok(()) => Ok(()),
+            Ok(outcome) => Ok(outcome),
             Err(Error::Io(_, ref ioe)) if ioe.kind() == std::io::ErrorKind::NotFound => {
                 // Shard dir missing. `ensure_shards_exist` normally
                 // pre-creates all 256 shards; this only fires when the
@@ -449,8 +477,15 @@ impl Store {
         // install). On a warm CAS, concurrent writers are safe: EEXIST
         // means another writer already materialized this content (same
         // hash = same bytes), so we skip and share the entry.
-        Self::create_cas_file(&store_path, Some(content))?;
-        if !cas_file_matches_len(&store_path, content.len() as u64) {
+        //
+        // `Created` means we just wrote the bytes — they are exactly
+        // `content.len()` by construction, no need to re-stat. Only
+        // the `AlreadyExisted` branch can produce a torn file (from a
+        // crashed predecessor) so the length check runs there only.
+        let outcome = Self::create_cas_file(&store_path, Some(content))?;
+        if outcome == CasWriteOutcome::AlreadyExisted
+            && !cas_file_matches_len(&store_path, content.len() as u64)
+        {
             let _ = xx::file::remove_file(&store_path);
             Self::create_cas_file(&store_path, Some(content))?;
             if !cas_file_matches_len(&store_path, content.len() as u64) {
