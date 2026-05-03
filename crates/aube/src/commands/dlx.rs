@@ -37,6 +37,12 @@ pub struct DlxArgs {
     /// Overrides inferring from the command.
     #[arg(short = 'p', long = "package")]
     pub package: Vec<String>,
+    #[command(flatten)]
+    pub lockfile: crate::cli_args::LockfileArgs,
+    #[command(flatten)]
+    pub network: crate::cli_args::NetworkArgs,
+    #[command(flatten)]
+    pub virtual_store: crate::cli_args::VirtualStoreArgs,
 }
 
 /// `aube dlx [-p <pkg>]... <command> [args...]`
@@ -53,10 +59,16 @@ pub struct DlxArgs {
 ///   3. Exec `<tmp>/node_modules/.bin/<command>` from the user's original cwd.
 ///   4. tempfile removes the scratch dir on drop.
 pub async fn run(args: DlxArgs) -> miette::Result<()> {
+    args.network.install_overrides();
+    args.lockfile.install_overrides();
+    args.virtual_store.install_overrides();
     let DlxArgs {
         params,
         package,
         shell_mode,
+        lockfile: _,
+        network: _,
+        virtual_store: _,
     } = args;
 
     // Bare `aube dlx` or `aube dlx --help` / `-h` prints aube's dlx help.

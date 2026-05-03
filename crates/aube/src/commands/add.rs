@@ -135,6 +135,12 @@ pub struct AddArgs {
     /// this flag to opt in. Mirrors `pnpm add -W`.
     #[arg(short = 'W', long)]
     pub ignore_workspace_root_check: bool,
+    #[command(flatten)]
+    pub lockfile: crate::cli_args::LockfileArgs,
+    #[command(flatten)]
+    pub network: crate::cli_args::NetworkArgs,
+    #[command(flatten)]
+    pub virtual_store: crate::cli_args::VirtualStoreArgs,
 }
 
 /// Parsed result of a package spec like "lodash@^4" or "my-alias@npm:real-pkg@^2".
@@ -614,6 +620,9 @@ pub async fn run(
     args: AddArgs,
     filter: aube_workspace::selector::EffectiveFilter,
 ) -> miette::Result<()> {
+    args.network.install_overrides();
+    args.lockfile.install_overrides();
+    args.virtual_store.install_overrides();
     if !filter.is_empty() && !args.global && !args.workspace {
         return run_filtered(args, &filter).await;
     }
@@ -632,6 +641,9 @@ pub async fn run(
         save_catalog,
         save_catalog_name,
         allow_build,
+        lockfile,
+        network,
+        virtual_store,
     } = args;
     let save_catalog_target = save_catalog_name.or_else(|| {
         if save_catalog {
@@ -646,7 +658,7 @@ pub async fn run(
     }
 
     if global {
-        return run_global(packages).await;
+        return run_global(packages, lockfile, network, virtual_store).await;
     }
 
     // `--workspace` / `-w`: redirect the add at the workspace root
@@ -1741,7 +1753,12 @@ async fn run_filtered(
 /// bin linking. Without this guard every failed `add -g` would leak a
 /// subdir that `scan_packages` ignores (no hash symlink) but disk space
 /// keeps.
-async fn run_global(packages: &[String]) -> miette::Result<()> {
+async fn run_global(
+    packages: &[String],
+    lockfile: crate::cli_args::LockfileArgs,
+    network: crate::cli_args::NetworkArgs,
+    virtual_store: crate::cli_args::VirtualStoreArgs,
+) -> miette::Result<()> {
     use super::global;
 
     let mut layout = global::GlobalLayout::resolve()?;
@@ -1786,7 +1803,15 @@ async fn run_global(packages: &[String]) -> miette::Result<()> {
         .filter(|e| e.file_type().map(|t| t.is_symlink()).unwrap_or(false))
         .map(|e| e.path())
         .collect();
-    let result = run_global_inner(packages, &layout, &install_dir).await;
+    let result = run_global_inner(
+        packages,
+        &layout,
+        &install_dir,
+        lockfile,
+        network,
+        virtual_store,
+    )
+    .await;
     if result.is_err() {
         let _ = std::fs::remove_dir_all(&install_dir);
         if let Ok(entries) = std::fs::read_dir(&layout.pkg_dir) {
@@ -1819,6 +1844,9 @@ async fn run_global_inner(
     packages: &[String],
     layout: &super::global::GlobalLayout,
     install_dir: &std::path::Path,
+    lockfile: crate::cli_args::LockfileArgs,
+    network: crate::cli_args::NetworkArgs,
+    virtual_store: crate::cli_args::VirtualStoreArgs,
 ) -> miette::Result<()> {
     use super::global;
 
@@ -1883,6 +1911,14 @@ async fn run_global_inner(
         save_catalog: false,
         save_catalog_name: None,
         allow_build: Vec::new(),
+        // Propagate the outer caller's flag groups through so the inner
+        // run()'s `install_overrides()` calls reset the global slots to the
+        // same values rather than wiping them — `set_registry_override`
+        // backs an RwLock that always overwrites, unlike the OnceLock
+        // siblings, so a `Default` here would silently drop `--registry`.
+        lockfile,
+        network,
+        virtual_store,
     };
     Box::pin(run(
         inner,
