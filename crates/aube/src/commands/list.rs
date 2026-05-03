@@ -166,18 +166,12 @@ pub async fn run(
         return run_global(&args);
     }
 
-    let cwd = crate::dirs::project_or_workspace_root()?;
-    // In yarn / npm / bun monorepos the lockfile lives only at the
-    // workspace root, not in the subpackage. When the caller asks for
-    // `--filter` we read manifest + lockfile from the root so
-    // `run_filtered` sees the real graph — otherwise `parse_lockfile`
-    // returns `NotFound` from the child and we exit before ever
-    // iterating the workspace.
-    let read_from = if !filter.is_empty() {
-        crate::dirs::find_workspace_root(&cwd).unwrap_or_else(|| cwd.clone())
-    } else {
-        cwd.clone()
-    };
+    // Workspace root wins over the nearest project root so `aube list`
+    // run from inside `packages/foo/` reads the lockfile + manifest at
+    // the workspace root instead of the subpackage (which has no
+    // lockfile of its own). Plain single-project trees fall back to
+    // the project root for free.
+    let cwd = crate::dirs::workspace_or_project_root()?;
 
     // When a workspace filter is set, resolve workspace + selectors
     // first so a no-match case takes the warn-and-exit-0 path before
@@ -203,20 +197,17 @@ pub async fn run(
     };
 
     let selected = if !filter.is_empty() {
-        let workspace_pkgs = aube_workspace::find_workspace_packages(&read_from)
+        let workspace_pkgs = aube_workspace::find_workspace_packages(&cwd)
             .map_err(|e| miette!("failed to discover workspace packages: {e}"))?;
         if workspace_pkgs.is_empty() {
             return Err(miette!(
                 "aube list: --filter requires a workspace root (aube-workspace.yaml, pnpm-workspace.yaml, or package.json with a `workspaces` field) at or above {}",
-                read_from.display()
+                cwd.display()
             ));
         }
-        let selected = aube_workspace::selector::select_workspace_packages(
-            &read_from,
-            &workspace_pkgs,
-            &filter,
-        )
-        .map_err(|e| miette!("invalid --filter selector: {e}"))?;
+        let selected =
+            aube_workspace::selector::select_workspace_packages(&cwd, &workspace_pkgs, &filter)
+                .map_err(|e| miette!("invalid --filter selector: {e}"))?;
         if selected.is_empty() {
             if filter.fail_if_no_match {
                 let shown: Vec<&str> = filter
@@ -230,7 +221,7 @@ pub async fn run(
                 ));
             }
             if format == ListFormat::Default {
-                println!("No projects matched the filters in {}", read_from.display());
+                println!("No projects matched the filters in {}", cwd.display());
             }
             return Ok(());
         }
@@ -244,11 +235,11 @@ pub async fn run(
     // Pure-coordinator workspaces (pnpm-workspace.yaml at the root, no root
     // package.json) read as a default manifest so the lockfile parser still
     // gets the same shape it expects.
-    let manifest = super::load_manifest_or_default(&read_from)?;
+    let manifest = super::load_manifest_or_default(&cwd)?;
 
     // Lockfile may be absent in a brand-new project — treat that as "nothing
     // installed yet" rather than a hard error, and print an empty tree.
-    let graph = match aube_lockfile::parse_lockfile(&read_from, &manifest) {
+    let graph = match aube_lockfile::parse_lockfile(&cwd, &manifest) {
         Ok(g) => g,
         Err(aube_lockfile::Error::NotFound(_)) => {
             eprintln!("No lockfile found. Run `aube install` to populate node_modules.");
@@ -264,24 +255,23 @@ pub async fn run(
     // Resolve `virtualStoreDirMaxLength` once so `--long` mode prints
     // the same `.aube/<name>` filename the linker actually wrote.
     // Passing the default would mis-report long dep_paths on projects
-    // that customize the cap via `.npmrc`. Read from `read_from` so
-    // a yarn / npm / bun subpackage inherits the root's settings
-    // instead of falling back to defaults when the child has no
-    // `.npmrc` / `pnpm-workspace.yaml`.
-    let vstore_max_len = super::resolve_virtual_store_dir_max_length_for_cwd(&read_from);
+    // that customize the cap via `.npmrc`. `cwd` is the workspace root
+    // when one exists, so subpackages inherit the root's settings
+    // instead of falling back to defaults.
+    let vstore_max_len = super::resolve_virtual_store_dir_max_length_for_cwd(&cwd);
     // Resolve `virtualStoreDir` too — without this, `--long` would
     // always print `./node_modules/.aube/...` even when the user has
     // relocated the virtual store (e.g. `virtualStoreDir=node_modules/vstore`
     // or an out-of-tree absolute path), pointing at a path that
     // doesn't exist.
     let vstore_prefix = super::format_virtual_store_display_prefix(
-        &super::resolve_virtual_store_dir_for_cwd(&read_from),
-        &read_from,
+        &super::resolve_virtual_store_dir_for_cwd(&cwd),
+        &cwd,
     );
 
     if let Some(selected) = selected {
         return run_filtered(
-            &read_from,
+            &cwd,
             &manifest,
             &graph,
             &args,
