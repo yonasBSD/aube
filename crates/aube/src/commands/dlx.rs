@@ -18,9 +18,11 @@ pub struct DlxArgs {
     /// it.
     ///
     /// The first positional is the command; the rest are forwarded
-    /// verbatim to the installed binary. Under `--shell-mode`/`-c` the
+    /// verbatim to the binary. Without `--package`, a local
+    /// `node_modules/.bin/<command>` wins when present; otherwise dlx
+    /// installs into a throwaway project. Under `--shell-mode`/`-c` the
     /// positionals are joined and evaluated by `sh -c` instead of
-    /// looked up in `node_modules/.bin`.
+    /// looked up directly.
     #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
     pub params: Vec<String>,
     /// Run the assembled command line through `sh -c`.
@@ -110,6 +112,18 @@ pub async fn run(args: DlxArgs) -> miette::Result<()> {
     // user assembles their own line and we run it through `sh -c`, so any
     // bin lookup is the shell's job.
     let bin_name = bin_name_for(&command);
+    if !explicit_package && !shell_mode && can_use_local_bin(&command) {
+        let initial_cwd = crate::dirs::cwd()?;
+        if let Some(project_dir) = crate::dirs::find_project_root(&initial_cwd) {
+            let bin_path = super::project_modules_dir(&project_dir)
+                .join(".bin")
+                .join(&bin_name);
+            if bin_path.exists() {
+                return super::exec::exec_bin(&initial_cwd, &bin_path, &bin_name, &bin_args, false)
+                    .await;
+            }
+        }
+    }
 
     let tmp = tempfile::Builder::new()
         .prefix("aube-dlx-")
@@ -223,7 +237,7 @@ pub async fn run(args: DlxArgs) -> miette::Result<()> {
         // it the sh shim fails with `%1 is not a valid Win32 application`
         // (os error 193). Prefer the `.cmd` shim on Windows; on Unix
         // the bare shim is the executable.
-        let exec_path = resolve_exec_shim(&bin_path);
+        let exec_path = super::exec::resolve_exec_shim(&bin_path);
         tokio::process::Command::new(&exec_path)
             .args(&bin_args)
             .current_dir(&prev_cwd)
@@ -398,30 +412,8 @@ fn bin_name_for(command: &str) -> String {
     name.rsplit('/').next().unwrap_or(name).to_string()
 }
 
-/// Pick the executable variant of a `node_modules/.bin/<name>` shim.
-///
-/// On Unix the bare path is a sh shebang script and is what we want.
-/// On Windows the linker writes three shim files for every bin —
-/// `<name>.cmd`, `<name>.ps1`, and a bare `<name>` sh shim — because
-/// the same `node_modules` may be shared with bash / git-bash. The
-/// bare shim is a sh script that CreateProcess can't execute (and so
-/// `Command::new` fails with `%1 is not a valid Win32 application`).
-/// Pick the `.cmd` shim, which is what npm/pnpm/yarn run.
-///
-/// We don't fall back to `.ps1` here: PowerShell scripts can't be
-/// launched by `Command::new` either (they need `powershell.exe -File`),
-/// and the linker always writes `.cmd` whenever it writes `.ps1`.
-fn resolve_exec_shim(bin_path: &std::path::Path) -> std::path::PathBuf {
-    #[cfg(windows)]
-    {
-        if bin_path.extension().is_none() {
-            let cmd_path = bin_path.with_extension("cmd");
-            if cmd_path.exists() {
-                return cmd_path;
-            }
-        }
-    }
-    bin_path.to_path_buf()
+fn can_use_local_bin(command: &str) -> bool {
+    !is_non_registry_spec(command) && super::split_name_spec(command).1.is_none()
 }
 
 /// When the bin derived from the package name doesn't match the installed
@@ -494,33 +486,13 @@ mod tests {
     }
 
     #[test]
-    fn resolve_exec_shim_returns_bare_path_when_no_sibling() {
-        let tmp = tempfile::tempdir().unwrap();
-        let bare = tmp.path().join("loner");
-        std::fs::write(&bare, b"#!/bin/sh\n").unwrap();
-        assert_eq!(resolve_exec_shim(&bare), bare);
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn resolve_exec_shim_prefers_cmd_sibling_on_windows() {
-        let tmp = tempfile::tempdir().unwrap();
-        let bare = tmp.path().join("cowsay");
-        let cmd_shim = tmp.path().join("cowsay.cmd");
-        std::fs::write(&bare, b"#!/bin/sh\n").unwrap();
-        std::fs::write(&cmd_shim, b"@echo off\n").unwrap();
-        assert_eq!(resolve_exec_shim(&bare), cmd_shim);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn resolve_exec_shim_keeps_bare_path_on_unix() {
-        let tmp = tempfile::tempdir().unwrap();
-        let bare = tmp.path().join("cowsay");
-        let cmd_shim = tmp.path().join("cowsay.cmd");
-        std::fs::write(&bare, b"#!/bin/sh\n").unwrap();
-        std::fs::write(&cmd_shim, b"@echo off\n").unwrap();
-        assert_eq!(resolve_exec_shim(&bare), bare);
+    fn local_bin_shortcut_only_applies_to_bare_registry_names() {
+        assert!(can_use_local_bin("cowsay"));
+        assert!(can_use_local_bin("@scope/foo"));
+        assert!(!can_use_local_bin("cowsay@1.5.0"));
+        assert!(!can_use_local_bin("cowsay@next"));
+        assert!(!can_use_local_bin("@scope/foo@2"));
+        assert!(!can_use_local_bin("github:owner/repo"));
     }
 
     #[test]
