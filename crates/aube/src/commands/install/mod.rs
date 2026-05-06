@@ -979,6 +979,22 @@ pub(super) async fn run_gvs_prewarm_materializer(
         let key = format!("{name}@{version}");
         patch_hashes.get(&key).cloned()
     };
+
+    // Build a probe linker without graph_hashes to check GVS mode
+    // first. compute_graph_hashes_with_patches walks every package
+    // BLAKE3-style, expensive on huge graphs. Skip it when GVS is
+    // off so per-project installs and cold CI (CI=true gates GVS)
+    // don't pay for hashes nothing reads.
+    let mut probe = aube_linker::Linker::new(store.as_ref(), link_strategy)
+        .with_virtual_store_dir_max_length(virtual_store_dir_max_length);
+    if let Some(enabled) = use_global_virtual_store_override {
+        probe = probe.with_use_global_virtual_store(enabled);
+    }
+    if !probe.uses_global_virtual_store() {
+        return run_aube_dir_materializer(probe, graph, cwd, link_concurrency, materialize_rx)
+            .await;
+    }
+
     let graph_hashes_arc = std::sync::Arc::new(
         aube_lockfile::graph_hash::compute_graph_hashes_with_patches(
             &graph,
@@ -987,21 +1003,9 @@ pub(super) async fn run_gvs_prewarm_materializer(
             &patch_hash_fn,
         ),
     );
-
-    let mut linker = aube_linker::Linker::new(store.as_ref(), link_strategy)
-        .with_graph_hashes((*graph_hashes_arc).clone())
-        .with_virtual_store_dir_max_length(virtual_store_dir_max_length);
+    let mut linker = probe.with_graph_hashes((*graph_hashes_arc).clone());
     if !patches.is_empty() {
         linker = linker.with_patches(patches);
-    }
-    if let Some(enabled) = use_global_virtual_store_override {
-        linker = linker.with_use_global_virtual_store(enabled);
-    }
-    if !linker.uses_global_virtual_store() {
-        // Per-project mode. Drain rx, return empty stats.
-        let mut rx = materialize_rx;
-        while rx.recv().await.is_some() {}
-        return Ok((aube_linker::LinkStats::default(), Some(graph_hashes_arc)));
     }
     let linker = std::sync::Arc::new(linker);
 
@@ -1082,6 +1086,125 @@ pub(super) async fn run_gvs_prewarm_materializer(
         total.files_linked += s.files_linked;
     }
     Ok((total, Some(graph_hashes_arc)))
+}
+
+/// Per-project materializer: pipelines the link work into the fetch
+/// phase under non-GVS mode. Each (canonical_key, PackageIndex) the
+/// fetch coordinator emits triggers a `materialize_into` against the
+/// per-project `.aube/<dep_path>/`, so by the time fetch finishes
+/// the dedicated link phase only has to create the top-level
+/// `node_modules/<name>` symlinks.
+async fn run_aube_dir_materializer(
+    linker: aube_linker::Linker,
+    graph: std::sync::Arc<aube_lockfile::LockfileGraph>,
+    cwd: std::path::PathBuf,
+    link_concurrency: Option<usize>,
+    materialize_rx: tokio::sync::mpsc::Receiver<(String, aube_store::PackageIndex)>,
+) -> miette::Result<(
+    aube_linker::LinkStats,
+    Option<std::sync::Arc<aube_lockfile::graph_hash::GraphHashes>>,
+)> {
+    let aube_dir = std::sync::Arc::new(linker.aube_dir_for(&cwd));
+    aube_linker::mkdirp(&aube_dir).map_err(|e| miette!("create {}: {e}", aube_dir.display()))?;
+    let nested_link_targets =
+        aube_linker::build_nested_link_targets(&cwd, &graph).map(std::sync::Arc::new);
+
+    // Channel emits `pkg.dep_path` (canonical on the resolver's
+    // first-pass packages, contextualized on post-pass). When the
+    // received key is a canonical that fans out to one-or-more
+    // peer-contextualized variants in the graph, this map points
+    // canonical -> {contextualized dep_paths}. Identity entries
+    // (canonical == dep_path) are skipped because the receive loop
+    // falls back to a direct graph lookup for those.
+    let mut canonical_to_contextualized: aube_util::collections::FxMap<
+        String,
+        aube_util::collections::FxSet<String>,
+    > = aube_util::collections::FxMap::default();
+    for (dep_path, pkg) in &graph.packages {
+        if pkg.local_source.is_some() {
+            continue;
+        }
+        let canonical = pkg.spec_key();
+        if canonical != *dep_path {
+            canonical_to_contextualized
+                .entry(canonical)
+                .or_default()
+                .insert(dep_path.clone());
+        }
+    }
+
+    let linker = std::sync::Arc::new(linker);
+    let permits = link_concurrency.unwrap_or_else(aube_linker::default_linker_parallelism);
+    let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(permits));
+    // JoinSet aborts in-flight tasks if we early-return on error,
+    // so a failed materialize doesn't leave orphan tasks racing
+    // disk writes against the install driver's cleanup.
+    let mut in_flight: tokio::task::JoinSet<miette::Result<aube_linker::LinkStats>> =
+        tokio::task::JoinSet::new();
+    let mut total = aube_linker::LinkStats::default();
+    let mut rx = materialize_rx;
+    while let Some((key, index)) = rx.recv().await {
+        // Surface task failures while still receiving so a sustained
+        // I/O error aborts before we queue hundreds more.
+        while let Some(joined) = in_flight.try_join_next() {
+            let s = joined.into_diagnostic()??;
+            total.packages_linked += s.packages_linked;
+            total.packages_cached += s.packages_cached;
+            total.files_linked += s.files_linked;
+        }
+
+        let dep_paths: Vec<String> = if let Some(set) = canonical_to_contextualized.get(&key) {
+            set.iter().cloned().collect()
+        } else if graph.packages.contains_key(&key) {
+            vec![key.clone()]
+        } else {
+            continue;
+        };
+        let index = std::sync::Arc::new(index);
+        for dep_path in dep_paths {
+            let Some(pkg) = graph.packages.get(&dep_path).cloned() else {
+                continue;
+            };
+            if pkg.local_source.is_some() {
+                continue;
+            }
+            let linker = linker.clone();
+            let sem = sem.clone();
+            let index = index.clone();
+            let aube_dir = aube_dir.clone();
+            let nested_link_targets = nested_link_targets.clone();
+            in_flight.spawn(async move {
+                let _permit = sem
+                    .acquire()
+                    .await
+                    .map_err(|e| miette!("materializer semaphore closed: {e}"))?;
+                let dep_path_for_err = dep_path.clone();
+                tokio::task::spawn_blocking(move || -> miette::Result<_> {
+                    let mut stats = aube_linker::LinkStats::default();
+                    linker
+                        .ensure_in_aube_dir(
+                            &aube_dir,
+                            &dep_path,
+                            &pkg,
+                            &index,
+                            &mut stats,
+                            nested_link_targets.as_deref(),
+                        )
+                        .map_err(|e| miette!("materialize {dep_path_for_err}: {e}"))?;
+                    Ok(stats)
+                })
+                .await
+                .into_diagnostic()?
+            });
+        }
+    }
+    while let Some(joined) = in_flight.join_next().await {
+        let s = joined.into_diagnostic()??;
+        total.packages_linked += s.packages_linked;
+        total.packages_cached += s.packages_cached;
+        total.files_linked += s.files_linked;
+    }
+    Ok((total, None))
 }
 
 // `network_concurrency`: override for the tarball-fetch semaphore.
@@ -1295,15 +1418,11 @@ where
                 cached_count += 1;
             }
             CheckResult::Cached(index) => {
-                if let Some(tx) = materialize_tx.as_ref() {
-                    // Send err means consumer died. Bail rather than
-                    // keep filling a dead pipeline.
-                    tx.send((dep_path.clone(), index.clone()))
-                        .await
-                        .map_err(|_| {
-                            miette!("materializer task exited before fetch_packages finished")
-                        })?;
-                }
+                // Don't stream Cached items through the materializer.
+                // The link phase fast-paths them via pkg_nm_dir.exists()
+                // anyway, so the per-pkg spawn pair was pure overhead
+                // on warm-cache installs (1400-pkg fixture saw +66%
+                // wall time before the skip).
                 indices.insert(dep_path, index);
                 cached_count += 1;
             }
@@ -1378,8 +1497,7 @@ where
         // the libc lock fires once instead of N times on a 1000-pkg
         // install.
         let streaming_sha512_enabled = std::env::var_os("AUBE_DISABLE_STREAMING_SHA512").is_none();
-        let tarball_stream_enabled = std::env::var_os("AUBE_TARBALL_STREAM").is_some()
-            && std::env::var_os("AUBE_DISABLE_TARBALL_STREAM").is_none();
+        let tarball_stream_enabled = std::env::var_os("AUBE_DISABLE_TARBALL_STREAM").is_none();
         // JoinSet so a first-error path aborts the sibling fetches
         // instead of detaching them into the background. Detached
         // tasks keep writing to the CAS after the install command
@@ -3007,8 +3125,8 @@ pub async fn run(opts: InstallOptions) -> miette::Result<()> {
                 // Hoist env-driven flags out of the per-tarball loop.
                 let streaming_sha512_enabled =
                     std::env::var_os("AUBE_DISABLE_STREAMING_SHA512").is_none();
-                let tarball_stream_enabled = std::env::var_os("AUBE_TARBALL_STREAM").is_some()
-                    && std::env::var_os("AUBE_DISABLE_TARBALL_STREAM").is_none();
+                let tarball_stream_enabled =
+                    std::env::var_os("AUBE_DISABLE_TARBALL_STREAM").is_none();
                 // JoinSet over bare Vec<JoinHandle>. If the first
                 // fetch errors and we return via `?`, a plain Vec
                 // drops the remaining JoinHandles which detaches the
