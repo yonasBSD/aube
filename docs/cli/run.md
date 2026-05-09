@@ -43,15 +43,15 @@ Skip auto-install check
 
 ### `--no-sort`
 
-Disable topological sorting.
+Disable topological sorting (default is on).
 
-Parsed for pnpm compatibility.
+Without this, recursive runs visit packages in a deps-first order so a `build` script in a shared library finishes before a dependent app's `build` starts. Pass this to fall back to the raw workspace-listing order.
 
 ### `--parallel`
 
 Run the script in every matched workspace package concurrently.
 
-Unbounded parallelism. Pair with a filter (`-r` / `-F`) — single-package runs ignore it. First non-zero exit fails the whole run, but siblings are allowed to finish so their output isn't truncated.
+Unbounded parallelism. Pair with `--workspace-concurrency=N` to cap the worker count. Single-package runs ignore this flag. First non-zero exit fails the whole run, but siblings are allowed to finish so their output isn't truncated. Child stdio is piped and lines are emitted with a `<package>: ` prefix; pass `--reporter-hide-prefix` to drop the labels.
 
 ### `--report-summary`
 
@@ -61,27 +61,27 @@ Parsed for pnpm compatibility.
 
 ### `--reporter-hide-prefix`
 
-Hide package prefixes in recursive reporter output.
+Hide the `<package>: ` label on parallel-run output lines.
 
-Parsed for pnpm compatibility.
+Lines are still piped through aube (so the line breaks are clean even when many packages run at once), but the source package isn't named on each line. Sequential runs ignore this flag.
 
 ### `--resume-from <PACKAGE>`
 
-Resume recursive execution from a package name.
+Resume recursive execution starting at this package name.
 
-Parsed for pnpm compatibility.
+After the topo sort and `--reverse` are applied, packages before the named one in the resulting order are skipped. Errors if the name isn't in the matched workspace set.
 
 ### `--reverse`
 
-Run recursive packages in reverse order.
+Reverse the recursive execution order (after topo sort).
 
-Parsed for pnpm compatibility.
+Useful for teardown-style scripts where dependents must shut down before their deps.
 
 ### `--sort`
 
-Sort recursive packages topologically.
+Sort recursive packages topologically (this is the default).
 
-Parsed for pnpm compatibility.
+Pass to override an earlier `--no-sort` on the same invocation.
 
 ### `-s`
 
@@ -91,9 +91,9 @@ Short alias for the global `--silent` flag; long form is intentionally omitted t
 
 ### `--workspace-concurrency <N>`
 
-Recursive workspace concurrency.
+Cap the number of recursive packages running at once.
 
-Parsed for pnpm compatibility.
+Setting this implicitly enables parallel mode at width `N`. `0` means "use the available CPU count". Without this flag, `--parallel` stays unbounded.
 
 ### `--frozen-lockfile`
 

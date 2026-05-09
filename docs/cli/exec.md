@@ -30,9 +30,9 @@ Skip auto-install check
 
 ### `--no-sort`
 
-Disable topological sorting.
+Disable topological sorting (default is on).
 
-Parsed for pnpm compatibility.
+Without this, recursive execs visit packages in a deps-first order. Pass this to fall back to raw workspace-listing order.
 
 ### `--parallel`
 
@@ -46,21 +46,19 @@ Parsed for pnpm compatibility.
 
 ### `--reporter-hide-prefix`
 
-Hide package prefixes in recursive reporter output.
+Hide the `<package>: ` label on parallel-exec output lines.
 
-Parsed for pnpm compatibility.
+Lines are still piped (clean line breaks even with concurrent children) but the source package isn't named on each line. Sequential execs ignore this flag.
 
 ### `--resume-from <PACKAGE>`
 
-Resume recursive execution from a package name.
+Resume recursive execution starting at this package name.
 
-Parsed for pnpm compatibility.
+Packages before the named one in the post-sort, post-reverse order are skipped. Errors if the name isn't in the matched set.
 
 ### `--reverse`
 
-Run recursive packages in reverse order.
-
-Parsed for pnpm compatibility.
+Reverse the recursive execution order (after topo sort)
 
 ### `-c --shell-mode`
 
@@ -68,15 +66,15 @@ Run the command through `sh -c`
 
 ### `--sort`
 
-Sort recursive packages topologically.
+Sort recursive packages topologically (this is the default).
 
-Parsed for pnpm compatibility.
+Pass to override an earlier `--no-sort` on the same invocation.
 
 ### `--workspace-concurrency <N>`
 
-Recursive workspace concurrency.
+Cap the number of recursive packages running at once.
 
-Parsed for pnpm compatibility.
+Setting this implicitly enables parallel mode at width `N`. `0` means "use the available CPU count". Without this flag, `--parallel` stays unbounded.
 
 ### `--frozen-lockfile`
 

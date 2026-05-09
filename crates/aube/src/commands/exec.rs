@@ -19,9 +19,10 @@ pub struct ExecArgs {
     /// Skip auto-install check
     #[arg(long)]
     pub no_install: bool,
-    /// Disable topological sorting.
+    /// Disable topological sorting (default is on).
     ///
-    /// Parsed for pnpm compatibility.
+    /// Without this, recursive execs visit packages in a deps-first
+    /// order. Pass this to fall back to raw workspace-listing order.
     #[arg(long, overrides_with = "sort")]
     pub no_sort: bool,
     /// Run recursive workspace executions concurrently.
@@ -32,32 +33,35 @@ pub struct ExecArgs {
     /// Parsed for pnpm compatibility.
     #[arg(long)]
     pub report_summary: bool,
-    /// Hide package prefixes in recursive reporter output.
+    /// Hide the `<package>: ` label on parallel-exec output lines.
     ///
-    /// Parsed for pnpm compatibility.
+    /// Lines are still piped (clean line breaks even with concurrent
+    /// children) but the source package isn't named on each line.
+    /// Sequential execs ignore this flag.
     #[arg(long)]
     pub reporter_hide_prefix: bool,
-    /// Resume recursive execution from a package name.
+    /// Resume recursive execution starting at this package name.
     ///
-    /// Parsed for pnpm compatibility.
+    /// Packages before the named one in the post-sort, post-reverse
+    /// order are skipped. Errors if the name isn't in the matched set.
     #[arg(long, value_name = "PACKAGE")]
     pub resume_from: Option<String>,
-    /// Run recursive packages in reverse order.
-    ///
-    /// Parsed for pnpm compatibility.
+    /// Reverse the recursive execution order (after topo sort).
     #[arg(long)]
     pub reverse: bool,
     /// Run the command through `sh -c`.
     #[arg(short = 'c', long)]
     pub shell_mode: bool,
-    /// Sort recursive packages topologically.
+    /// Sort recursive packages topologically (this is the default).
     ///
-    /// Parsed for pnpm compatibility.
+    /// Pass to override an earlier `--no-sort` on the same invocation.
     #[arg(long, overrides_with = "no_sort")]
     pub sort: bool,
-    /// Recursive workspace concurrency.
+    /// Cap the number of recursive packages running at once.
     ///
-    /// Parsed for pnpm compatibility.
+    /// Setting this implicitly enables parallel mode at width `N`.
+    /// `0` means "use the available CPU count". Without this flag,
+    /// `--parallel` stays unbounded.
     #[arg(long, value_name = "N")]
     pub workspace_concurrency: Option<usize>,
     #[command(flatten)]
@@ -81,14 +85,14 @@ pub async fn run(
         no_install,
         parallel,
         no_bail: _,
-        no_sort: _,
+        no_sort,
         report_summary: _,
-        reporter_hide_prefix: _,
-        resume_from: _,
-        reverse: _,
+        reporter_hide_prefix,
+        resume_from,
+        reverse,
         shell_mode,
         sort: _,
-        workspace_concurrency: _,
+        workspace_concurrency,
         lockfile: _,
         network: _,
         virtual_store: _,
@@ -98,7 +102,16 @@ pub async fn run(
     ensure_installed(no_install).await?;
 
     if !filter.is_empty() {
-        return run_filtered(&cwd, &bin, &args, shell_mode, parallel, &filter).await;
+        // Same defaulting rule as `aube run`: sort=on unless `--no-sort`
+        // was explicitly passed.
+        let recursive = super::run::RecursiveOpts {
+            sort: !no_sort,
+            reverse,
+            resume_from,
+            workspace_concurrency,
+            reporter_hide_prefix,
+        };
+        return run_filtered(&cwd, &bin, &args, shell_mode, parallel, &filter, recursive).await;
     }
 
     let bin_path = super::project_modules_dir(&cwd).join(".bin").join(&bin);
@@ -112,72 +125,143 @@ async fn run_filtered(
     shell_mode: bool,
     parallel: bool,
     filter: &aube_workspace::selector::EffectiveFilter,
+    recursive: super::run::RecursiveOpts,
 ) -> miette::Result<()> {
     let (_root, matched) = super::select_workspace_packages(cwd, filter, "exec")?;
-    if parallel {
-        if !shell_mode {
-            for pkg in &matched {
-                let bin_path = super::project_modules_dir(&pkg.dir).join(".bin").join(bin);
-                if !bin_path.exists() {
-                    let name = pkg
-                        .name
-                        .as_deref()
-                        .unwrap_or_else(|| pkg.dir.to_str().unwrap_or("<unknown>"));
-                    return Err(miette!(
-                        "binary not found in {name}: {bin}\nTry running `aube install` first, or check that the package providing '{bin}' is in its dependencies."
-                    ));
-                }
-            }
-        }
+    let matched = super::run::order_matched_packages(matched, &recursive)?;
 
-        let mut tasks: Vec<tokio::task::JoinHandle<miette::Result<std::process::ExitStatus>>> =
-            Vec::with_capacity(matched.len());
-        let mut task_names = Vec::with_capacity(matched.len());
-        for pkg in matched {
-            let name = pkg
-                .name
-                .clone()
-                .unwrap_or_else(|| pkg.dir.display().to_string());
-            let bin_path = super::project_modules_dir(&pkg.dir).join(".bin").join(bin);
-            let dir = pkg.dir.clone();
-            let bin = bin.to_string();
-            let args = args.to_vec();
-            task_names.push(name);
-            tasks.push(tokio::spawn(async move {
-                exec_bin_status(&dir, &bin_path, &bin, &args, shell_mode).await
-            }));
-        }
-
-        let mut first_err: Option<miette::Report> = None;
-        let mut first_exit: Option<i32> = None;
-        for (task, name) in tasks.into_iter().zip(task_names) {
-            match task.await {
-                Ok(Ok(status)) => {
-                    if !status.success() && first_exit.is_none() {
-                        let code = aube_scripts::exit_code_from_status(status);
-                        first_exit = Some(code);
-                        first_err =
-                            Some(miette!("aube exec: `{bin}` failed in {name} (exit {code})"));
-                    }
-                }
-                Ok(Err(e)) if first_err.is_none() => first_err = Some(e),
-                Ok(Err(_)) => {}
-                Err(e) if first_err.is_none() => first_err = Some(miette!("task panicked: {e}")),
-                Err(_) => {}
-            }
-        }
-        if let Some(code) = first_exit {
-            std::process::exit(code);
-        }
-        if let Some(e) = first_err {
-            return Err(e);
-        }
-        return Ok(());
+    if let Some(concurrency) =
+        super::run::effective_concurrency(parallel, recursive.workspace_concurrency)
+    {
+        return run_filtered_parallel(
+            bin,
+            args,
+            shell_mode,
+            matched,
+            concurrency,
+            recursive.reporter_hide_prefix,
+            recursive.reverse,
+        )
+        .await;
     }
 
     for pkg in matched {
         let bin_path = super::project_modules_dir(&pkg.dir).join(".bin").join(bin);
         exec_bin(&pkg.dir, &bin_path, bin, args, shell_mode).await?;
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_filtered_parallel(
+    bin: &str,
+    args: &[String],
+    shell_mode: bool,
+    matched: Vec<aube_workspace::selector::SelectedPackage>,
+    concurrency: usize,
+    reporter_hide_prefix: bool,
+    reverse: bool,
+) -> miette::Result<()> {
+    use std::sync::Arc;
+    use tokio::sync::Semaphore;
+
+    if !shell_mode {
+        for pkg in &matched {
+            let bin_path = super::project_modules_dir(&pkg.dir).join(".bin").join(bin);
+            if !bin_path.exists() {
+                let name = pkg
+                    .name
+                    .as_deref()
+                    .unwrap_or_else(|| pkg.dir.to_str().unwrap_or("<unknown>"));
+                return Err(miette!(
+                    "binary not found in {name}: {bin}\nTry running `aube install` first, or check that the package providing '{bin}' is in its dependencies."
+                ));
+            }
+        }
+    }
+
+    // Topo barrier: same dep-before-dependent contract as
+    // `run_filtered_parallel` in run.rs — see that function's doc for
+    // the watch-channel rationale, cycle handling, and reverse-mode
+    // transposition.
+    let prereqs = aube_workspace::topo::compute_prereq_indices(&matched);
+    let prereqs = if reverse {
+        aube_workspace::topo::transpose_prereqs(&prereqs)
+    } else {
+        prereqs
+    };
+    let senders: Vec<tokio::sync::watch::Sender<bool>> = (0..matched.len())
+        .map(|_| tokio::sync::watch::channel(false).0)
+        .collect();
+    let prereq_rxs_per_task: Vec<Vec<tokio::sync::watch::Receiver<bool>>> = (0..matched.len())
+        .map(|i| prereqs[i].iter().map(|&j| senders[j].subscribe()).collect())
+        .collect();
+
+    let sem = Arc::new(Semaphore::new(concurrency));
+    let mut tasks: Vec<tokio::task::JoinHandle<miette::Result<std::process::ExitStatus>>> =
+        Vec::with_capacity(matched.len());
+    let mut task_names = Vec::with_capacity(matched.len());
+    let mut senders_iter = senders.into_iter();
+    let mut prereq_rxs_iter = prereq_rxs_per_task.into_iter();
+    for (index, pkg) in matched.into_iter().enumerate() {
+        let name = pkg
+            .name
+            .clone()
+            .unwrap_or_else(|| pkg.dir.display().to_string());
+        let output_mode = if reporter_hide_prefix {
+            super::run_output::OutputMode::NoPrefix
+        } else {
+            super::run_output::OutputMode::prefix(pkg.name.as_deref(), index)
+        };
+        let prereq_rxs = prereq_rxs_iter.next().expect("one rx vec per package");
+        let done_tx = senders_iter.next().expect("one sender per package");
+        let bin_path = super::project_modules_dir(&pkg.dir).join(".bin").join(bin);
+        let dir = pkg.dir.clone();
+        let bin = bin.to_string();
+        let args = args.to_vec();
+        let sem = Arc::clone(&sem);
+        task_names.push(name);
+        tasks.push(tokio::spawn(async move {
+            for mut rx in prereq_rxs {
+                while !*rx.borrow_and_update() {
+                    if rx.changed().await.is_err() {
+                        break;
+                    }
+                }
+            }
+            let _permit = sem
+                .acquire_owned()
+                .await
+                .map_err(|e| miette!("workspace concurrency semaphore closed: {e}"))?;
+            let result =
+                exec_bin_status(&dir, &bin_path, &bin, &args, shell_mode, &output_mode).await;
+            let _ = done_tx.send(true);
+            result
+        }));
+    }
+
+    let mut first_err: Option<miette::Report> = None;
+    let mut first_exit: Option<i32> = None;
+    for (task, name) in tasks.into_iter().zip(task_names) {
+        match task.await {
+            Ok(Ok(status)) => {
+                if !status.success() && first_exit.is_none() {
+                    let code = aube_scripts::exit_code_from_status(status);
+                    first_exit = Some(code);
+                    first_err = Some(miette!("aube exec: `{bin}` failed in {name} (exit {code})"));
+                }
+            }
+            Ok(Err(e)) if first_err.is_none() => first_err = Some(e),
+            Ok(Err(_)) => {}
+            Err(e) if first_err.is_none() => first_err = Some(miette!("task panicked: {e}")),
+            Err(_) => {}
+        }
+    }
+    if let Some(code) = first_exit {
+        std::process::exit(code);
+    }
+    if let Some(e) = first_err {
+        return Err(e);
     }
     Ok(())
 }
@@ -245,10 +329,12 @@ pub(crate) async fn exec_bin_status(
     bin: &str,
     args: &[String],
     shell_mode: bool,
+    output_mode: &super::run_output::OutputMode,
 ) -> miette::Result<std::process::ExitStatus> {
-    exec_bin_status_with_node_args(cwd, bin_path, bin, args, &[], shell_mode).await
+    exec_bin_status_with_node_args(cwd, bin_path, bin, args, &[], shell_mode, output_mode).await
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn exec_bin_status_with_node_args(
     cwd: &Path,
     bin_path: &Path,
@@ -256,6 +342,7 @@ pub(crate) async fn exec_bin_status_with_node_args(
     args: &[String],
     node_args: &[String],
     shell_mode: bool,
+    output_mode: &super::run_output::OutputMode,
 ) -> miette::Result<std::process::ExitStatus> {
     if !shell_mode && !bin_path.exists() {
         return Err(miette!(
@@ -281,13 +368,8 @@ pub(crate) async fn exec_bin_status_with_node_args(
         cmd.args(args);
         cmd
     };
-    command
-        .current_dir(cwd)
-        .stderr(aube_scripts::child_stderr())
-        .status()
-        .await
-        .into_diagnostic()
-        .wrap_err("failed to execute binary")
+    command.current_dir(cwd);
+    super::run_output::run_command(command, output_mode).await
 }
 
 fn node_bin_command(
