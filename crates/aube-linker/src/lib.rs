@@ -1504,16 +1504,33 @@ impl Linker {
             let importer_dir = if importer_path == "." {
                 root_dir.to_path_buf()
             } else {
-                root_dir.join(importer_path)
+                // Collapse `..` segments lexically — a parent-relative
+                // importer key (`../sibling`, possible when
+                // `pnpm-workspace.yaml#packages` uses `../**`) needs
+                // to land at the actual sibling dir before
+                // `pathdiff`/`strip_prefix` see it.
+                aube_util::path::normalize_lexical(&root_dir.join(importer_path))
             };
             // Workspace deps resolve through `workspace_dirs` rather
             // than going through the placement tree, so the hoisted
             // planner shouldn't try to copy their contents. Filter
             // them out of the seed set — we'll symlink them in a
             // post-pass below.
+            //
+            // Same gating as the isolated mode below: the resolver
+            // omits a `LockedPackage` for workspace-resolved siblings,
+            // so a name match plus a missing package entry is the
+            // signal that the resolver picked the sibling. When the
+            // resolved package IS in `graph.packages`, the resolver
+            // pinned a registry version and the dep should follow the
+            // normal hoisted-placement path (otherwise the post-pass
+            // would silently substitute the local copy).
             let planner_deps: Vec<aube_lockfile::DirectDep> = deps
                 .iter()
-                .filter(|d| !workspace_dirs.contains_key(&d.name))
+                .filter(|d| {
+                    !workspace_dirs.contains_key(&d.name)
+                        || graph.packages.contains_key(&d.dep_path)
+                })
                 .cloned()
                 .collect();
             hoisted::link_hoisted_importer(
@@ -1535,6 +1552,11 @@ impl Linker {
                 let Some(ws_dir) = workspace_dirs.get(&dep.name) else {
                     continue;
                 };
+                // See planner_deps gating above: skip deps the
+                // resolver actually pinned to a registry version.
+                if graph.packages.contains_key(&dep.dep_path) {
+                    continue;
+                }
                 let link_path = nm.join(&dep.name);
                 if let Some(parent) = link_path.parent() {
                     mkdirp(parent)?;
@@ -1879,7 +1901,15 @@ impl Linker {
             let nm = if importer_path == "." {
                 root_nm.clone()
             } else {
-                root_dir.join(importer_path).join(&self.modules_dir_name)
+                // Same lexical-normalization rationale as the hoisted
+                // path above: a `../sibling` importer key has to land
+                // at the actual sibling's `node_modules` rather than
+                // `<root>/../sibling/node_modules`, otherwise
+                // `pathdiff` produces a symlink target with the wrong
+                // depth (one extra `..` per uncollapsed segment).
+                aube_util::path::normalize_lexical(
+                    &root_dir.join(importer_path).join(&self.modules_dir_name),
+                )
             };
             if importer_path != "." {
                 mkdirp(&nm)?;
@@ -1929,7 +1959,13 @@ impl Linker {
                 let nm = if importer_path == "." {
                     root_nm.clone()
                 } else {
-                    root_dir.join(importer_path).join(&self.modules_dir_name)
+                    // Same lexical-normalization rationale as
+                    // `link_workspace_hoisted` above: parent-relative
+                    // importer keys must collapse before `pathdiff`
+                    // computes the top-level symlink target.
+                    aube_util::path::normalize_lexical(
+                        &root_dir.join(importer_path).join(&self.modules_dir_name),
+                    )
                 };
                 deps.iter().map(move |dep| Step2Task {
                     importer_path: importer_path.as_str(),
@@ -1964,9 +2000,30 @@ impl Linker {
 
                     let link_path = nm.join(&dep.name);
 
-                    // Workspace dep (`workspace:` protocol): link
-                    // straight into the sibling package dir.
-                    if let Some(ws_dir) = workspace_dirs.get(&dep.name) {
+                    // Workspace dep (`workspace:` protocol or bare
+                    // semver that satisfies the sibling's version):
+                    // link straight into the sibling package dir.
+                    //
+                    // Gate on the resolver's decision, not just the
+                    // name match. The resolver omits a `LockedPackage`
+                    // entry for workspace-resolved siblings (the
+                    // `workspace_packages` branch in resolve.rs only
+                    // pushes a `DirectDep`, never inserts into
+                    // `resolved`), so a `dep_path` with no package
+                    // entry means "resolver picked the sibling". When
+                    // the package IS in `graph.packages`, the resolver
+                    // pinned a registry version — even if a sibling
+                    // shares the name, the user's spec didn't
+                    // satisfy it (e.g. `is-positive: "2.0.0"` with a
+                    // workspace sibling at `3.0.0`). Falling through
+                    // to the registry branch in that case prevents the
+                    // linker from silently substituting an
+                    // incompatible local copy for the resolved
+                    // version recorded in the lockfile.
+                    if workspace_dirs.contains_key(&dep.name)
+                        && !graph.packages.contains_key(&dep.dep_path)
+                    {
+                        let ws_dir = &workspace_dirs[&dep.name];
                         if !self.hoist_workspace_packages {
                             return Ok(false);
                         }

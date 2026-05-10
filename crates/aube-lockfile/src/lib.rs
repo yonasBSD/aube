@@ -1267,6 +1267,7 @@ impl LockfileGraph {
         workspace_overrides: &BTreeMap<String, String>,
         workspace_ignored_optional: &[String],
         workspace_catalogs: &BTreeMap<String, BTreeMap<String, String>>,
+        is_workspace_install: bool,
     ) -> DriftStatus {
         // Override drift is checked once at the workspace level, against
         // the root manifest. Workspace-package manifests may declare
@@ -1308,6 +1309,37 @@ impl LockfileGraph {
             ) {
                 DriftStatus::Fresh => continue,
                 stale => return stale,
+            }
+        }
+        // Stale-importer pass: in a workspace install, lockfile
+        // importer entries for workspace projects that no longer
+        // exist on disk must invalidate the lockfile. Without this
+        // guard, the warm-path short-circuit and drift check both
+        // report fresh and the next install carries the orphan
+        // importer/snapshot pair forward in the shared lockfile
+        // until a user explicitly runs `--no-frozen-lockfile`.
+        //
+        // Gated on the caller-supplied `is_workspace_install` flag
+        // (true when `pnpm-workspace.yaml` exists or `package.json`
+        // declares `workspaces`) — the manifests array can collapse
+        // to `[(".", root)]` even in a workspace install when the
+        // last sub-package is removed, so a manifest-shape check
+        // would miss the all-packages-gone case. The flag is also
+        // what tells us we're not in the npm `package-lock.json`
+        // path, where the parser synthesizes importer entries for
+        // every `file:` link and a manifest-shape gate would
+        // false-positive on legitimate single-package installs.
+        if is_workspace_install {
+            let current_importers: std::collections::HashSet<&str> =
+                manifests.iter().map(|(p, _)| p.as_str()).collect();
+            for importer_path in self.importers.keys() {
+                if !current_importers.contains(importer_path.as_str()) {
+                    return DriftStatus::Stale {
+                        reason: format!(
+                            "workspace importer {importer_path} is in the lockfile but not in the workspace"
+                        ),
+                    };
+                }
             }
         }
         DriftStatus::Fresh
@@ -2832,6 +2864,7 @@ mod drift_tests {
                 &BTreeMap::new(),
                 &[],
                 &BTreeMap::new(),
+                true,
             ),
             DriftStatus::Fresh
         );
@@ -3272,6 +3305,7 @@ mod drift_tests {
             &BTreeMap::new(),
             &[],
             &BTreeMap::new(),
+            true,
         ) {
             DriftStatus::Stale { reason } => {
                 assert!(reason.contains("packages/app"));
@@ -3702,7 +3736,8 @@ mod drift_tests {
                 &workspace_manifests,
                 &BTreeMap::new(),
                 &[],
-                &BTreeMap::new()
+                &BTreeMap::new(),
+                true,
             ),
             DriftStatus::Fresh
         );

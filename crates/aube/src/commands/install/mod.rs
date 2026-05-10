@@ -2442,6 +2442,14 @@ pub async fn run(opts: InstallOptions) -> miette::Result<()> {
         .wrap_err("failed to discover workspace packages")?;
     let recursive_install = aube_settings::resolved::recursive_install(&settings_ctx);
     let has_workspace = !workspace_packages.is_empty();
+    // Distinct from `has_workspace`: `is_workspace_project` stays
+    // true when every workspace sub-package was just removed from
+    // disk but the workspace yaml / `workspaces` field is still in
+    // place. The lockfile drift check needs this stronger signal so
+    // it still prunes orphan importer entries on the all-packages-
+    // gone boundary, where `manifests` collapses to `[(".", root)]`
+    // and looks indistinguishable from a non-workspace install.
+    let is_workspace_project = aube_workspace::is_workspace_project_root(&cwd);
     let link_all_workspace_importers =
         has_workspace && (recursive_install || !opts.workspace_filter.is_empty());
 
@@ -2467,9 +2475,16 @@ pub async fn run(opts: InstallOptions) -> miette::Result<()> {
             // and silently drop the importer from `--filter` installs.
             // Second risk: Linux CI reading a Windows-written lockfile
             // sees unknown keys and forces a re-resolve drift.
-            let rel_path = pkg_dir
-                .strip_prefix(&cwd)
-                .unwrap_or(pkg_dir)
+            //
+            // `pathdiff` is used (rather than `strip_prefix`) so a
+            // workspace whose `pnpm-workspace.yaml#packages` glob
+            // reaches into the parent tree (`../**`) writes the
+            // importer key as `../sibling` instead of an absolute
+            // path. The lockfile and the linker both read these keys
+            // back through `workspace_importer_path`, which uses the
+            // same relative form.
+            let rel_path = pathdiff::diff_paths(pkg_dir, &cwd)
+                .unwrap_or_else(|| pkg_dir.clone())
                 .to_string_lossy()
                 .replace('\\', "/");
 
@@ -2739,7 +2754,7 @@ pub async fn run(opts: InstallOptions) -> miette::Result<()> {
                 parsed,
                 Ok((g, _))
                     if matches!(
-                        g.check_drift_workspace(&manifests, &ws_config_shared.overrides, &ws_config_shared.ignored_optional_dependencies, &workspace_catalogs),
+                        g.check_drift_workspace(&manifests, &ws_config_shared.overrides, &ws_config_shared.ignored_optional_dependencies, &workspace_catalogs, is_workspace_project),
                         DriftStatus::Fresh,
                     )
                         && matches!(g.check_catalogs_drift(&workspace_catalogs), DriftStatus::Fresh)
@@ -3004,6 +3019,7 @@ pub async fn run(opts: InstallOptions) -> miette::Result<()> {
                         &ws_config_shared.overrides,
                         &ws_config_shared.ignored_optional_dependencies,
                         &workspace_catalogs,
+                        is_workspace_project,
                     ) {
                         return Err(miette!(
                             "lockfile is out of date with package.json: {reason}\n\
@@ -3036,6 +3052,7 @@ pub async fn run(opts: InstallOptions) -> miette::Result<()> {
                                 &ws_config_shared.overrides,
                                 &ws_config_shared.ignored_optional_dependencies,
                                 &workspace_catalogs,
+                                is_workspace_project,
                             ) {
                                 DriftStatus::Fresh => Ok((graph.clone(), *kind)),
                                 DriftStatus::Stale { reason } => {
@@ -5371,7 +5388,14 @@ fn importer_project_dir(
     if importer_path == "." {
         workspace_root.to_path_buf()
     } else {
-        workspace_root.join(importer_path)
+        // Lexically collapse `..` from the join so a parent-relative
+        // importer key (`../sibling`, written by `find_workspace_packages`
+        // when `pnpm-workspace.yaml#packages` uses `../**`) lands at
+        // the actual sibling directory rather than `<root>/../sibling`.
+        // Downstream consumers — `pathdiff` for symlink targets and
+        // `strip_prefix` for ancestor checks — give wrong results
+        // against an unnormalized path with embedded `..` segments.
+        aube_util::path::normalize_lexical(&workspace_root.join(importer_path))
     }
 }
 
