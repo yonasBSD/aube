@@ -712,15 +712,23 @@ Method for importing packages from the store into node_modules.
 - Workspace YAML keys: `packageImportMethod`
 
 Controls how aube materializes files from the global content-addressable
-store into the virtual store. `auto` (default) probes the destination
-filesystem and picks the fastest strategy: reflink (clonefile/btrfs CoW)
-→ hardlink → copy. Explicit values force a single strategy: `hardlink`
-hard-links from the store (with a copy fallback on cross-filesystem
-errors), `copy` always writes a full copy, `clone` uses reflink (and
-currently falls back to copy when reflink is unsupported — strict
-enforcement is planned for a future release), and `clone-or-copy`
-tries reflink first and falls back to a plain copy instead of
-hardlinking. Overridable per-invocation with `--package-import-method`.
+store into the virtual store.
+
+- `auto` (default) probes the destination filesystem and picks
+  `hardlink` with a `copy` fallback on cross-filesystem boundaries.
+  Hardlink benchmarks faster than reflink across every target reflink
+  supports (APFS clonefile, btrfs/xfs FICLONE), so `auto` skips the
+  reflink probe.
+- `hardlink` hard-links from the store, with a copy fallback on
+  cross-filesystem errors.
+- `copy` always writes a full copy.
+- `clone` uses reflink. Currently falls back to copy when reflink is
+  unsupported; strict enforcement is planned for a future release
+  (`WARN_AUBE_CLONE_STRATEGY_FALLBACK`).
+- `clone-or-copy` tries reflink first and falls back to a plain copy
+  instead of hardlinking.
+
+Overridable per-invocation with `--package-import-method`.
 
 ### `modulesCacheMaxAge` {#setting-modulescachemaxage}
 

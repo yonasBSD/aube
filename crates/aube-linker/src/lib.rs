@@ -542,7 +542,10 @@ fn with_link_pool<R: Send>(threads: usize, f: impl FnOnce() -> R + Send) -> R {
 /// Strategy for linking files from the store to node_modules.
 #[derive(Debug, Clone, Copy)]
 pub enum LinkStrategy {
-    /// Copy-on-write (APFS clonefile, btrfs reflink)
+    /// Copy-on-write (APFS clonefile, btrfs reflink). Selected by
+    /// explicit `packageImportMethod = clone` / `clone-or-copy`;
+    /// `auto` picks [`Hardlink`] because hardlink is measurably
+    /// faster on every benchmarked target.
     Reflink,
     /// Hard link (ext4, NTFS)
     Hardlink,
@@ -938,10 +941,16 @@ impl Linker {
     /// form for installs where the store lives on a different
     /// filesystem than the project (USB drives, bind mounts, Docker
     /// volumes, cross-drive Windows installs). Otherwise the probe
-    /// reports reflink or hardlink based on project-FS self-test,
-    /// then every real link call crosses an FS boundary and hits
-    /// EXDEV. Runtime falls back to `fs::copy` per file silently,
-    /// thousands of wasted syscalls, user thinks they got hardlinks.
+    /// reports hardlink based on project-FS self-test, then every
+    /// real link call crosses an FS boundary and hits EXDEV. Runtime
+    /// falls back to `fs::copy` per file silently, thousands of
+    /// wasted syscalls, user thinks they got hardlinks.
+    ///
+    /// Returns `Hardlink` when the probe succeeds, `Copy` otherwise.
+    /// Reflink is reachable only through explicit
+    /// `packageImportMethod = clone` / `clone-or-copy`; `auto` resolves
+    /// to `Hardlink` because hardlink benchmarks faster across every
+    /// target reflink supports (APFS clonefile, btrfs/xfs FICLONE).
     pub fn detect_strategy(path: &Path) -> LinkStrategy {
         Self::detect_strategy_cross(path, path)
     }
@@ -949,14 +958,14 @@ impl Linker {
     /// Two-arg probe. src is the store shard (or any dir on the
     /// store FS), dst is the project modules dir (or any dir on the
     /// destination FS). Probe creates a real cross-mount src file
-    /// and tries to reflink/hardlink into dst, which catches EXDEV
-    /// up front.
+    /// and tries to hardlink into dst, which catches EXDEV up front.
+    /// Returns `Hardlink` when the probe succeeds, `Copy` otherwise.
     pub fn detect_strategy_cross(src_dir: &Path, dst_dir: &Path) -> LinkStrategy {
         // Memoize per (src_dir, dst_dir) for the process lifetime.
-        // The probe writes a real test file and tries reflink +
-        // hardlink, ~3 syscalls + 2 unlinks. Multiple Linker
-        // instances within one install (prewarm + final + per-
-        // workspace) all repeat the probe; cache the answer.
+        // The probe writes a real test file and tries hardlink,
+        // ~2 syscalls + 2 unlinks. Multiple Linker instances within
+        // one install (prewarm + final + per-workspace) all repeat
+        // the probe; cache the answer.
         type ProbeKey = (std::path::PathBuf, std::path::PathBuf);
         static CACHE: std::sync::OnceLock<
             std::sync::RwLock<std::collections::HashMap<ProbeKey, LinkStrategy>>,
@@ -971,32 +980,25 @@ impl Linker {
         let test_dst = dst_dir.join(".aube-link-test-dst");
 
         let strategy = if std::fs::write(&test_src, b"test").is_ok() {
-            if reflink_copy::reflink(&test_src, &test_dst).is_ok() {
-                let _ = std::fs::remove_file(&test_src);
-                let _ = std::fs::remove_file(&test_dst);
-                LinkStrategy::Reflink
+            let result = if std::fs::hard_link(&test_src, &test_dst).is_ok() {
+                LinkStrategy::Hardlink
             } else {
-                let _ = std::fs::remove_file(&test_dst);
-                let result = if std::fs::hard_link(&test_src, &test_dst).is_ok() {
-                    LinkStrategy::Hardlink
-                } else {
-                    LinkStrategy::Copy
-                };
-                let _ = std::fs::remove_file(&test_src);
-                let _ = std::fs::remove_file(&test_dst);
-                result
-            }
+                LinkStrategy::Copy
+            };
+            let _ = std::fs::remove_file(&test_src);
+            let _ = std::fs::remove_file(&test_dst);
+            result
         } else {
             LinkStrategy::Copy
         };
 
-        // First-write-wins via `entry().or_insert_with`. Two
-        // concurrent linker probes (prewarm + final) sharing the same
+        // First-write-wins via `entry().or_insert`. Two concurrent
+        // linker probes (prewarm + final) sharing the same
         // (src_dir, dst_dir) can race on the test files: one observes
-        // reflink-ok, the other sees the first writer's leftover and
+        // hardlink-ok, the other sees the first writer's leftover and
         // falls back to Copy. `.insert()` would let the wrong Copy
-        // result clobber the correct Reflink for the rest of the
-        // process; `or_insert_with` keeps whichever value landed first.
+        // result clobber the correct Hardlink for the rest of the
+        // process; `or_insert` keeps whichever value landed first.
         *cache
             .write()
             .expect("probe cache poisoned")
@@ -2776,7 +2778,7 @@ impl Linker {
         Ok(())
     }
 
-    /// Hardlink/reflink/copy a file into a freshly-created destination.
+    /// Hardlink-or-copy a file into a freshly-created destination.
     /// Assumes `dst` does not exist — callers (`materialize_into`)
     /// always write into a `.tmp-<pid>-...` staging dir or a
     /// just-wiped per-project `.aube/<dep_path>`, so the defensive
@@ -3924,9 +3926,12 @@ mod tests {
     fn test_detect_strategy() {
         let dir = tempfile::tempdir().unwrap();
         let strategy = Linker::detect_strategy(dir.path());
-        // Should detect reflink or hardlink on most systems, never panic
+        // Probe returns `Hardlink` or `Copy`; `Reflink` is only
+        // reachable through explicit `packageImportMethod =
+        // clone`/`clone-or-copy`, so the match guards that contract.
         match strategy {
-            LinkStrategy::Reflink | LinkStrategy::Hardlink | LinkStrategy::Copy => {}
+            LinkStrategy::Hardlink | LinkStrategy::Copy => {}
+            LinkStrategy::Reflink => panic!("detect_strategy must not return Reflink"),
         }
     }
 
