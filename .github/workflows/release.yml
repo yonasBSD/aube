@@ -194,18 +194,34 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # BOLT runs against the glibc Linux PGO targets. Local bench
+          # on Zen 4 (x86_64) shows -2.7% wall / -18% L1-icache misses
+          # / -4.4% branch misses on the user-mode "frozen lockfile"
+          # fast path (z=-6.45 on wall, n=20). The canonical install
+          # benchmarks don't move statistically because system-call
+          # time dominates real installs — codegen wins exist but get
+          # buried under syscall jitter.
+          #
+          # musl is skipped because BOLT's instrumentation runtime
+          # (libbolt_rt_instr.a) assumes glibc semantics for _exit /
+          # TLS and SIGSEGVs at startup against musl libc. Confirmed
+          # empirically in dry-run 25688552218. macOS BOLT support is
+          # not in tree.
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
             runner: namespace-profile-endev-linux-amd64-large;overrides.cache-tag=aube-rust-linux
             build-tool: cross
+            bolt: true
           - target: x86_64-unknown-linux-musl
             os: ubuntu-latest
             runner: namespace-profile-endev-linux-amd64-large;overrides.cache-tag=aube-rust-linux
             build-tool: cross
+            bolt: false
           - target: aarch64-unknown-linux-gnu
             os: ubuntu-latest
             runner: namespace-profile-endev-linux-arm64-large;overrides.cache-tag=aube-rust-linux-arm64
             build-tool: cargo
+            bolt: true
           - target: aarch64-apple-darwin
             os: macos-latest
             # Trying GitHub's standard Apple Silicon runner — the
@@ -219,6 +235,7 @@ jobs:
             # before dropping macOS arm64 from the PGO matrix entirely.
             runner: macos-latest
             build-tool: cargo
+            bolt: false
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
@@ -273,6 +290,30 @@ jobs:
         if: ${{ matrix.build-tool == 'cross' }}
         shell: bash
         run: cargo install cross --locked
+      # BOLT (post-link layout optimizer) runs after PGO phase 3b on
+      # the Linux PGO rows. We pull it from apt.llvm.org rather than
+      # Ubuntu's archive because the noble `llvm-bolt`/`bolt-18`
+      # packages are amd64-only; apt.llvm.org publishes the same
+      # source for both amd64 and arm64. pgo.bash phase 4 uses BOLT's
+      # instrumentation mode, so no `perf` install or
+      # `kernel.perf_event_paranoid` tweaks are needed.
+      - name: Install BOLT toolchain
+        if: ${{ matrix.bolt }}
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends wget gnupg ca-certificates
+          sudo install -d -m 0755 /etc/apt/keyrings
+          wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key \
+            | sudo gpg --dearmor -o /etc/apt/keyrings/llvm.gpg
+          codename=$(. /etc/os-release && echo "$VERSION_CODENAME")
+          echo "deb [signed-by=/etc/apt/keyrings/llvm.gpg] https://apt.llvm.org/${codename}/ llvm-toolchain-${codename}-18 main" \
+            | sudo tee /etc/apt/sources.list.d/llvm-toolchain-18.list
+          sudo apt-get update
+          sudo apt-get install -y bolt-18
+          echo "/usr/lib/llvm-18/bin" >> "$GITHUB_PATH"
+          /usr/lib/llvm-18/bin/llvm-bolt --version | head -2
+          /usr/lib/llvm-18/bin/merge-fdata --help | head -2 || true
       # verdaccio is installed lazily by hermetic.bash's
       # _hermetic_ensure_verdaccio (called from pgo.bash via hermetic_start),
       # so no explicit install step is needed here.
@@ -288,6 +329,7 @@ jobs:
           AUBE_PGO_NO_LOCK: "1"
           AUBE_PGO_BUILD_TOOL: ${{ matrix.build-tool }}
           AUBE_PGO_TARGET: ${{ matrix.target }}
+          AUBE_PGO_BOLT: ${{ matrix.bolt && '1' || '' }}
         run: bash benchmarks/pgo.bash
       - name: Codesign macOS binaries
         if: startsWith(matrix.os, 'macos')
