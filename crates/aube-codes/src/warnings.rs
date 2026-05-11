@@ -342,7 +342,7 @@ pub const ALL: &[CodeMeta] = &[
     CodeMeta {
         name: WARN_AUBE_SLOW_METADATA,
         category: category::REGISTRY_PERF,
-        description: "A packument fetch exceeded `fetchWarnTimeoutMs`.",
+        description: "One or more packument fetches exceeded `fetchWarnTimeoutMs`. Emitted as a grouped summary so a burst of slow fetches produces one warning, not one per fetch.",
         exit_code: None,
     },
     CodeMeta {
