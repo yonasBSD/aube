@@ -45,11 +45,21 @@ pub fn run(args: GetArgs) -> miette::Result<()> {
     let entries: Vec<(String, String)> = match args.effective_location() {
         ListLocation::Merged => read_merged(&cwd)?,
         ListLocation::User | ListLocation::Global => {
-            let mut entries = super::aube_config::load_user_entries();
-            entries.extend(read_single(&user_npmrc_path()?)?);
+            // `aube_config` outranks `~/.npmrc`, so emit it last — the
+            // reversed-iteration lookup below returns the first match,
+            // i.e. the highest-precedence source for the requested key.
+            let mut entries = read_single(&user_npmrc_path()?)?;
+            entries.extend(super::aube_config::load_user_entries());
             entries
         }
-        ListLocation::Project => read_single(&cwd.join(".npmrc"))?,
+        ListLocation::Project => {
+            // Project-scope precedence (low → high): workspace yaml,
+            // project `.npmrc`, project `config.toml`.
+            let mut entries = super::read_workspace_yaml_flat(&cwd);
+            entries.extend(read_single(&cwd.join(".npmrc"))?);
+            entries.extend(super::aube_config::load_project_entries(&cwd));
+            entries
+        }
     };
 
     for (k, v) in entries.iter().rev() {

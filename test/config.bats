@@ -35,17 +35,21 @@ teardown() {
 	assert_output "true"
 }
 
-@test "config get and list prefer user .npmrc over user config.toml" {
+@test "config get and list prefer user config.toml over user .npmrc" {
+	# Aube's own user config wins over ~/.npmrc so values aube wrote
+	# via `aube config set` are authoritative — they are not silently
+	# shadowed by leftover entries in a shared .npmrc that other tools
+	# (npm, pnpm, yarn) also read.
 	mkdir -p "$XDG_CONFIG_HOME/aube"
 	echo "autoInstallPeers = true" >"$XDG_CONFIG_HOME/aube/config.toml"
 	echo "autoInstallPeers=false" >"$HOME/.npmrc"
 	run aube config get autoInstallPeers
 	assert_success
-	assert_output "false"
+	assert_output "true"
 	run aube config list --location user
 	assert_success
-	assert_line "auto-install-peers=false"
-	refute_line "auto-install-peers=true"
+	assert_line "auto-install-peers=true"
+	refute_line "auto-install-peers=false"
 }
 
 @test "config get --location project only reads project .npmrc" {
@@ -99,14 +103,21 @@ teardown() {
 	assert_output "undefined"
 }
 
-@test "config set collapses aliases so a prior spelling doesn't linger" {
+@test "config set for an aube-owned key leaves user .npmrc untouched" {
+	# Discussion #601: `aube config set <known-key>` writes to
+	# `config.toml` and must not edit `~/.npmrc`, which is shared with
+	# npm/pnpm/yarn. The new value still takes effect because
+	# `config.toml` outranks `~/.npmrc` in the resolver.
 	echo "auto-install-peers=false" >"$HOME/.npmrc"
 	run aube config set autoInstallPeers true
 	assert_success
 	run cat "$HOME/.npmrc"
-	refute_output --partial "auto-install-peers=false"
+	assert_output "auto-install-peers=false"
 	run cat "$XDG_CONFIG_HOME/aube/config.toml"
 	assert_output --partial "autoInstallPeers = true"
+	run aube config get autoInstallPeers
+	assert_success
+	assert_output "true"
 }
 
 @test "config delete removes a key" {
@@ -122,6 +133,21 @@ teardown() {
 	echo "registry=https://r.example.com/" >"$HOME/.npmrc"
 	run aube config delete autoInstallPeers
 	assert_failure
+}
+
+@test "config delete points at stale ~/.npmrc when an aube-known key lives only there" {
+	# Migration case: an older aube wrote aube-known keys to ~/.npmrc.
+	# After upgrading, `aube config delete <key>` should not silently
+	# touch ~/.npmrc (it's shared with npm/pnpm/yarn) — but the error
+	# must tell the user where the value actually is.
+	echo "autoInstallPeers=false" >"$HOME/.npmrc"
+	run aube config delete autoInstallPeers
+	assert_failure
+	assert_output --partial ".npmrc"
+	assert_output --partial "stale entry"
+	# Confirm the .npmrc line is preserved.
+	run cat "$HOME/.npmrc"
+	assert_output --partial "autoInstallPeers=false"
 }
 
 @test "config list prints merged entries" {
@@ -207,12 +233,173 @@ teardown() {
 	assert_output --partial "auto-install-peers=false"
 }
 
-@test "config set --location project writes to ./.npmrc" {
+@test "config set --location project writes aube-owned keys to project config.toml" {
+	# Project-scope aube settings land in <cwd>/.config/aube/config.toml,
+	# the same XDG layout used at user-scope. The project `.npmrc` is
+	# left alone so it remains a shared file with npm/pnpm/yarn.
 	run aube config set autoInstallPeers false --location project
+	assert_success
+	assert [ -f ".config/aube/config.toml" ]
+	run cat ".config/aube/config.toml"
+	assert_output --partial "autoInstallPeers = false"
+	# If a project `.npmrc` exists (e.g. for the test registry pin), it
+	# must not contain the aube-owned key.
+	if [ -f "./.npmrc" ]; then
+		run cat "./.npmrc"
+		refute_output --partial "autoInstallPeers"
+	fi
+}
+
+@test "config set --location project writes unknown keys to ./.npmrc" {
+	# Registry/auth-style keys aren't aube-owned settings and continue
+	# to land in project `.npmrc`.
+	run aube config set "//registry.example.com/:_authToken" secret --location project
 	assert_success
 	assert [ -f "./.npmrc" ]
 	run cat "./.npmrc"
-	assert_output --partial "autoInstallPeers=false"
+	assert_output --partial "//registry.example.com/:_authToken=secret"
+}
+
+@test "config get prefers project config.toml over project .npmrc" {
+	# Locality: project beats user; within project, config.toml beats
+	# `.npmrc` for the same reason it does at user-scope.
+	mkdir proj
+	echo "autoInstallPeers=false" >proj/.npmrc
+	mkdir -p "proj/.config/aube"
+	echo "autoInstallPeers = true" >"proj/.config/aube/config.toml"
+	cd proj
+	run aube config get autoInstallPeers
+	assert_success
+	assert_output "true"
+}
+
+@test "config set --location project writes to existing workspace yaml when one is present" {
+	# When a pnpm-workspace.yaml (or aube-workspace.yaml) already
+	# lives in the project, project-scope aube settings land there
+	# instead of creating a new `.config/aube/config.toml`. Keeps the
+	# project's config story to a single file when possible.
+	echo "packages:" >pnpm-workspace.yaml
+	echo "  - 'apps/*'" >>pnpm-workspace.yaml
+	run aube config set autoInstallPeers false --location project
+	assert_success
+	run cat pnpm-workspace.yaml
+	assert_output --partial "autoInstallPeers: false"
+	# Existing entries are preserved.
+	assert_output --partial "packages:"
+	# No new config.toml created.
+	assert [ ! -f ".config/aube/config.toml" ]
+	# Round-trip through `aube config get`.
+	run aube config get autoInstallPeers
+	assert_success
+	assert_output "false"
+}
+
+@test "config set --location project falls back to config.toml for settings without workspace yaml support" {
+	# `scriptShell` is not a workspace-yaml source per settings.toml,
+	# so the project write lands in `<cwd>/.config/aube/config.toml`
+	# even though a workspace yaml exists.
+	echo "packages:" >pnpm-workspace.yaml
+	echo "  - 'apps/*'" >>pnpm-workspace.yaml
+	run aube config set scriptShell /bin/zsh --location project
+	assert_success
+	assert [ -f ".config/aube/config.toml" ]
+	run cat ".config/aube/config.toml"
+	assert_output --partial 'scriptShell = "/bin/zsh"'
+	run cat pnpm-workspace.yaml
+	refute_output --partial "scriptShell"
+}
+
+@test "config set --location project to workspace yaml beats user-scope settings" {
+	# Project-scope writes routed to workspace yaml must not be
+	# silently shadowed by anything in ~/.npmrc or
+	# ~/.config/aube/config.toml. Scope locality: project beats user,
+	# and `pnpm-workspace.yaml` is project-scope.
+	#
+	# `proj/` is separate from $HOME so user-scope and project-scope
+	# config files don't collide.
+	mkdir proj
+	echo "autoInstallPeers=true" >"$HOME/.npmrc"
+	mkdir -p "$XDG_CONFIG_HOME/aube"
+	echo "autoInstallPeers = true" >"$XDG_CONFIG_HOME/aube/config.toml"
+	echo "packages:" >proj/pnpm-workspace.yaml
+	cd proj
+	run aube config set autoInstallPeers false --location project
+	assert_success
+	run cat pnpm-workspace.yaml
+	assert_output --partial "autoInstallPeers: false"
+	# Round-trip: get returns the project value, not user defaults.
+	run aube config get autoInstallPeers
+	assert_success
+	assert_output "false"
+}
+
+@test "config set --location project stays in config.toml once it exists" {
+	# If a project already adopted `.config/aube/config.toml`, later
+	# `set` calls keep landing there even after a `pnpm-workspace.yaml`
+	# is added. Writing to yaml would be silently shadowed by the
+	# higher-precedence config.toml entry on read.
+	run aube config set autoInstallPeers false --location project
+	assert_success
+	assert [ -f ".config/aube/config.toml" ]
+	echo "packages:" >pnpm-workspace.yaml
+	run aube config set autoInstallPeers true --location project
+	assert_success
+	run cat ".config/aube/config.toml"
+	assert_output --partial "autoInstallPeers = true"
+	run cat pnpm-workspace.yaml
+	refute_output --partial "autoInstallPeers"
+	# Effective value matches the latest set.
+	run aube config get autoInstallPeers
+	assert_success
+	assert_output "true"
+}
+
+@test "config delete --location project sweeps both workspace yaml and config.toml" {
+	# Regression for the silent-resurrection bug: a setting can end up
+	# in both files (e.g. set into config.toml first, into yaml later
+	# via a manual edit). Delete must clear both — otherwise the
+	# config.toml copy silently reactivates after the yaml removal.
+	mkdir -p ".config/aube"
+	echo "autoInstallPeers = true" >".config/aube/config.toml"
+	cat >pnpm-workspace.yaml <<EOF
+packages:
+  - 'apps/*'
+autoInstallPeers: false
+EOF
+	run aube config delete autoInstallPeers --location project
+	assert_success
+	run cat ".config/aube/config.toml"
+	refute_output --partial "autoInstallPeers"
+	run cat pnpm-workspace.yaml
+	refute_output --partial "autoInstallPeers"
+}
+
+@test "config delete --location project removes the key from workspace yaml" {
+	# Symmetric with set: delete removes from the workspace yaml
+	# when the value lives there.
+	cat >pnpm-workspace.yaml <<EOF
+packages:
+  - 'apps/*'
+autoInstallPeers: false
+EOF
+	run aube config delete autoInstallPeers --location project
+	assert_success
+	run cat pnpm-workspace.yaml
+	refute_output --partial "autoInstallPeers"
+	# Unrelated entries are preserved.
+	assert_output --partial "packages:"
+}
+
+@test "config get prefers project npmrc over user config.toml" {
+	# Scope locality: project `.npmrc` outranks user `config.toml`.
+	mkdir proj
+	mkdir -p "$XDG_CONFIG_HOME/aube"
+	echo "autoInstallPeers = true" >"$XDG_CONFIG_HOME/aube/config.toml"
+	echo "autoInstallPeers=false" >proj/.npmrc
+	cd proj
+	run aube config get autoInstallPeers
+	assert_success
+	assert_output "false"
 }
 
 @test "config preserves existing unrelated entries when setting a key" {

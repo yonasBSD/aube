@@ -70,8 +70,9 @@ pub(crate) struct KeyArgs {
     /// Which config location to act on.
     ///
     /// Defaults to `user`. Known aube settings use
-    /// `~/.config/aube/config.toml`; registry/auth and unknown keys
-    /// use `~/.npmrc`.
+    /// `~/.config/aube/config.toml` (user) or
+    /// `<cwd>/.config/aube/config.toml` (project); registry/auth and
+    /// unknown keys use `~/.npmrc` or `<cwd>/.npmrc` respectively.
     #[arg(long, value_enum, default_value_t = Location::User)]
     pub location: Location,
 }
@@ -110,7 +111,10 @@ pub(crate) enum ListLocation {
     Global,
 }
 
-pub(crate) use aube_config::load_user_entries as load_user_aube_config_entries;
+pub(crate) use aube_config::{
+    load_project_entries as load_project_aube_config_entries,
+    load_user_entries as load_user_aube_config_entries,
+};
 pub(crate) use get_cmd::GetArgs;
 pub(crate) use set_cmd::SetArgs;
 
@@ -269,16 +273,54 @@ fn search_text_matches(haystack: &str, term: &str) -> bool {
         .any(|word| word.starts_with(term))
 }
 
-/// Read aube's user config, `~/.npmrc`, then `<cwd>/.npmrc` and return
-/// every entry in file order so a later duplicate wins.
+/// Walk every config source in low-to-high precedence order so a later
+/// duplicate wins. Mirrors the chain the install pipeline applies via
+/// [`aube_settings::resolved`]:
+/// `userNpmrc < userAubeConfig < workspaceYaml < projectNpmrc <
+/// projectAubeConfig`. `workspaceYaml` sits above user-scope sources
+/// because it lives at the project root (scope locality). Per-setting
+/// `precedence` overrides in `settings.toml` can reorder file sources
+/// (e.g. `minimumReleaseAge` puts `workspaceYaml` first); `aube config
+/// get` shows the default-precedence view, which is accurate for the
+/// common cases.
 pub(super) fn read_merged(cwd: &Path) -> miette::Result<Vec<(String, String)>> {
     let mut out = Vec::new();
-    out.extend(aube_config::load_user_entries());
     if let Ok(user) = user_npmrc_path() {
         out.extend(read_single(&user)?);
     }
+    out.extend(aube_config::load_user_entries());
+    out.extend(read_workspace_yaml_flat(cwd));
     out.extend(read_single(&cwd.join(".npmrc"))?);
+    out.extend(aube_config::load_project_entries(cwd));
     Ok(out)
+}
+
+/// Surface flat scalar entries from the project's workspace yaml so
+/// `aube config get/list` can report values aube actually reads from
+/// there (`autoInstallPeers`, `nodeLinker`, `minimumReleaseAge`, …).
+/// Nested mappings (`updateConfig.ignoreDependencies`, `catalog`,
+/// `allowBuilds`) are skipped — they don't round-trip through a simple
+/// `(key, raw)` view and aren't what `config get <bare-key>` asks for.
+pub(super) fn read_workspace_yaml_flat(cwd: &Path) -> Vec<(String, String)> {
+    let Ok(map) = aube_manifest::workspace::load_raw(cwd) else {
+        return Vec::new();
+    };
+    map.iter()
+        .filter_map(|(k, v)| yaml_scalar_string(v).map(|raw| (k.clone(), raw)))
+        .collect()
+}
+
+fn yaml_scalar_string(value: &yaml_serde::Value) -> Option<String> {
+    match value {
+        yaml_serde::Value::String(s) => Some(s.clone()),
+        yaml_serde::Value::Number(n) => Some(n.to_string()),
+        yaml_serde::Value::Bool(b) => Some(b.to_string()),
+        yaml_serde::Value::Sequence(items) => {
+            let parts: Vec<String> = items.iter().filter_map(yaml_scalar_string).collect();
+            (!parts.is_empty()).then(|| parts.join(","))
+        }
+        _ => None,
+    }
 }
 
 pub(super) fn read_single(path: &std::path::Path) -> miette::Result<Vec<(String, String)>> {
