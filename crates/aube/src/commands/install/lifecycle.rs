@@ -228,39 +228,83 @@ fn resolve_jail_grant_path(project_dir: &std::path::Path, raw: &str) -> std::pat
 /// override, `.npmrc` / `pnpm-workspace.yaml`, or filesystem detection.
 /// Shared by the prewarm-GVS materializer (which needs the strategy
 /// before the full linker is built) and the link phase proper.
+///
+/// `planned_gvs` tells the probe where the linker will actually write
+/// files: when GVS is on, materialization targets the GVS dir (always
+/// on the cache-store FS), and `node_modules/.aube/<dep_path>` is a
+/// cross-FS-tolerant symlink. When GVS is off, materialization writes
+/// straight into the project's `.aube/<dep_path>`. Probing the
+/// destination the writes will hit avoids the cross-FS Copy verdict
+/// that would otherwise mis-fire on an install where the project
+/// lives on a different volume than the store but the GVS layer
+/// already absorbs the FS boundary as a symlink.
 pub(super) fn resolve_link_strategy(
     cwd: &std::path::Path,
     ctx: &aube_settings::ResolveCtx<'_>,
+    planned_gvs: bool,
 ) -> miette::Result<aube_linker::LinkStrategy> {
     let package_import_method_cli =
         aube_settings::values::string_from_cli("packageImportMethod", ctx.cli);
     // Shared probe used by both the CLI and resolved-setting paths
-    // below. Probe across store dir and project dir. Single-dir probe
-    // reports reflink but real link ops across a mount boundary hit
-    // EXDEV and silently fall back to per-file copy. Catches the
-    // cross-FS case at probe time without requiring node_modules to
-    // exist yet.
+    // below. The destination passed to `detect_strategy_cross` is the
+    // dir the linker will materialize files into:
+    //   * GVS enabled → `<store>/virtual-store/` (same FS as store →
+    //     hardlink works even when the *project* is on another mount;
+    //     the cross-FS hop is absorbed by the symlink from
+    //     `node_modules/.aube/<dep_path>`).
+    //   * GVS disabled → the project's `.aube/<dep_path>` lives on
+    //     the project FS, so probe against `cwd` to catch the cross-
+    //     FS case before every file `fs::copy` silently falls back.
     let auto_probe = || {
-        let store_dir = super::super::open_store(cwd)
-            .map(|s| s.root().to_path_buf())
-            .ok();
+        // Open the store once and derive both paths from the same
+        // handle. `open_store` performs lockfile + IO work; a second
+        // call to fetch `virtual_store_dir` would repeat that on the
+        // hot path of every `auto`-mode install.
+        let store = super::super::open_store(cwd).ok();
+        let store_dir = store.as_ref().map(|s| s.root().to_path_buf());
+        // Probe against the GVS dir when GVS is on. The GVS dir won't
+        // exist yet on a cold install, so create it before the probe
+        // writes its test file. If creation fails (permission, ENOSPC,
+        // …) `gvs_dir` falls back to `None` so the probe targets `cwd`
+        // — better to under-probe than to probe a non-existent dir and
+        // get a spurious `Copy` verdict.
+        let gvs_dir = planned_gvs
+            .then(|| store.as_ref().map(|s| s.virtual_store_dir()))
+            .flatten()
+            .filter(|gvs| std::fs::create_dir_all(gvs).is_ok());
+        let probe_dst = gvs_dir.as_deref().unwrap_or(cwd);
         let strategy = match store_dir.as_deref() {
-            Some(sd) => aube_linker::Linker::detect_strategy_cross(sd, cwd),
-            None => aube_linker::Linker::detect_strategy(cwd),
+            Some(sd) => aube_linker::Linker::detect_strategy_cross(sd, probe_dst),
+            None => aube_linker::Linker::detect_strategy(probe_dst),
         };
-        // Cross-volume install hits Copy fallback because hardlink
-        // and reflink can't cross device boundaries. aube still
-        // outperforms other PMs in this regime, so just log at debug
-        // for diagnosis without spamming WARN at every invocation.
+        // Two distinct cross-volume regimes, two different messages.
+        // With GVS on, the probe targets the GVS dir (always same FS
+        // as the store in a sane setup), so Copy here means the user
+        // pointed `storeDir` and `XDG_CACHE_HOME` at different volumes
+        // — a real misconfiguration that costs per-file copies. Warn.
+        // With GVS off, the probe targets `cwd`; a cross-volume verdict
+        // there is the documented "project lives on an external mount"
+        // regime where aube still outperforms other PMs, so log at
+        // debug to keep the warning out of normal install output.
         if matches!(strategy, aube_linker::LinkStrategy::Copy)
             && let Some(sd) = store_dir.as_deref()
-            && aube_util::fs::cross_volume(sd, cwd)
+            && aube_util::fs::cross_volume(sd, probe_dst)
         {
-            tracing::debug!(
-                store = %sd.display(),
-                project = %cwd.display(),
-                "cross-volume install, using per-file copy. set `storeDir` to a path on the project volume for hardlink fast path."
-            );
+            if gvs_dir.is_some() {
+                tracing::warn!(
+                    store = %sd.display(),
+                    gvs_dir = %probe_dst.display(),
+                    "global virtual store dir is on a different volume than `storeDir`; \
+                     install will fall back to per-file copy. Move `XDG_CACHE_HOME` \
+                     (or `storeDir`) so both live on the same volume."
+                );
+            } else {
+                tracing::debug!(
+                    store = %sd.display(),
+                    project = %cwd.display(),
+                    "cross-volume install, using per-file copy. set `storeDir` to a path on the project volume for hardlink fast path."
+                );
+            }
         }
         strategy
     };
