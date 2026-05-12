@@ -69,10 +69,11 @@ pub(crate) struct KeyArgs {
 
     /// Which config location to act on.
     ///
-    /// Defaults to `user`. Known aube settings use
-    /// `~/.config/aube/config.toml` (user) or
-    /// `<cwd>/.config/aube/config.toml` (project); registry/auth and
-    /// unknown keys use `~/.npmrc` or `<cwd>/.npmrc` respectively.
+    /// Defaults to `user`. Delete sweeps both aube's own config
+    /// (`~/.config/aube/config.toml` at user-scope,
+    /// `<cwd>/.config/aube/config.toml` at project-scope) and the
+    /// matching `.npmrc`, so the call works regardless of which file
+    /// the value was originally written to.
     #[arg(long, value_enum, default_value_t = Location::User)]
     pub location: Location,
 }
@@ -221,6 +222,26 @@ pub(super) fn literal_aliases(keys: &[&'static str]) -> Vec<String> {
         .filter(|k| is_literal_alias(k))
         .map(|s| s.to_string())
         .collect()
+}
+
+/// True when `key` belongs to the npm-shared `.npmrc` surface: npm,
+/// pnpm, and yarn read it from `.npmrc` so `aube config set` keeps
+/// the value there for cross-tool visibility. The two pattern checks
+/// cover per-host auth/cert templates (`//host/:_authToken`, etc.)
+/// and scoped registries (`@scope:registry`); everything else is
+/// driven by the `npmShared` flag on each entry in `settings.toml`,
+/// so the answer for any specific key lives next to that setting's
+/// other metadata rather than in a hardcoded list here.
+pub(super) fn is_npm_shared_key(key: &str) -> bool {
+    if key.starts_with("//") {
+        return true;
+    }
+    if let Some(rest) = key.strip_prefix('@')
+        && rest.ends_with(":registry")
+    {
+        return true;
+    }
+    setting_for_key(key).is_some_and(|meta| meta.npm_shared)
 }
 
 pub(super) fn setting_for_key(key: &str) -> Option<&'static settings_meta::SettingMeta> {

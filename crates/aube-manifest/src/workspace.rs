@@ -898,6 +898,81 @@ pub fn add_to_allow_builds(
     }
 }
 
+/// Upsert a single `<map>.<entry>` pair into the project's
+/// workspace-level config. Routes through [`config_write_target`]:
+/// workspace yaml when one exists, otherwise `<pnpm|aube>.<map>` in
+/// `package.json`. Returns the file that was written.
+///
+/// Used by `aube config set --local <map>.<entry> <value>` for any
+/// object-typed aube setting (`allowBuilds`, `overrides`,
+/// `packageExtensions`, …) so the dotted-key CLI syntax can write
+/// directly into the same maps `aube approve-builds` /
+/// install-time auto-deny seeding mutate. The value is passed in
+/// both yaml and json forms so the caller can choose the right scalar
+/// shape (bool vs string vs int) without this helper having to guess.
+pub fn upsert_map_entry(
+    project_dir: &Path,
+    map_name: &str,
+    entry_key: &str,
+    yaml_value: yaml_serde::Value,
+    json_value: serde_json::Value,
+) -> Result<PathBuf, crate::Error> {
+    match config_write_target(project_dir) {
+        ConfigWriteTarget::WorkspaceYaml(path) => {
+            edit_workspace_yaml(&path, |map| {
+                let submap = workspace_yaml_submap(map, map_name, &path)?;
+                submap.insert(yaml_serde::Value::String(entry_key.to_string()), yaml_value);
+                Ok(())
+            })?;
+            Ok(path)
+        }
+        ConfigWriteTarget::PackageJson => {
+            edit_setting_map(project_dir, map_name, |map| {
+                map.insert(entry_key.to_string(), json_value);
+            })?;
+            Ok(project_dir.join("package.json"))
+        }
+    }
+}
+
+/// Remove a single `<map>.<entry>` pair from the project's
+/// workspace-level config. Mirrors [`upsert_map_entry`]: sweeps both
+/// the workspace yaml (when one exists) and
+/// `<pnpm|aube>.<map>.<entry>` in `package.json` so a value set
+/// through either file can be deleted regardless of which one the
+/// current layout would have written to. Drops empty `<map>:`
+/// containers behind it so a removal doesn't leave a `{}` stub.
+///
+/// Returns `true` when at least one location held the entry. Used by
+/// `aube config delete --local <map>.<entry>` so dotted writes have
+/// a symmetric round-trip.
+pub fn remove_map_entry(
+    project_dir: &Path,
+    map_name: &str,
+    entry_key: &str,
+) -> Result<bool, crate::Error> {
+    let mut existed = false;
+    if let Some(yaml_path) = workspace_yaml_existing(project_dir) {
+        edit_workspace_yaml(&yaml_path, |map| {
+            let yaml_key = yaml_serde::Value::String(map_name.to_string());
+            let Some(submap) = map.get_mut(&yaml_key).and_then(|v| v.as_mapping_mut()) else {
+                return Ok(());
+            };
+            if submap.shift_remove(entry_key).is_some() {
+                existed = true;
+            }
+            if submap.is_empty() {
+                map.shift_remove(&yaml_key);
+            }
+            Ok(())
+        })?;
+    }
+    if remove_setting_entry(project_dir, map_name, entry_key)? {
+        existed = true;
+    }
+    Ok(existed)
+}
+
 /// How `add_to_allow_builds` should write each entry.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum AllowBuildsWriteMode {

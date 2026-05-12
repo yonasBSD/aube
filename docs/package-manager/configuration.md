@@ -18,9 +18,8 @@ CLI flags. Existing `pnpm-workspace.yaml` files are migration inputs.
 
 ## User aube config
 
-`aube config set` writes known aube-owned user settings to
-`~/.config/aube/config.toml` by default. If `XDG_CONFIG_HOME` is set, the path
-is `$XDG_CONFIG_HOME/aube/config.toml`.
+`aube config set` writes user-scope settings to `~/.config/aube/config.toml` by
+default. If `XDG_CONFIG_HOME` is set, the path is `$XDG_CONFIG_HOME/aube/config.toml`.
 
 ```toml
 minimumReleaseAge = 2880
@@ -29,28 +28,44 @@ nodeLinker = "isolated"
 packageImportMethod = "auto"
 ```
 
-This keeps aube-only settings out of `~/.npmrc`, so npm does not warn about
-unknown user config keys. aube still reads old user `.npmrc` settings for
-compatibility, but `aube config set <known-setting> <value>` removes stale user
-`.npmrc` aliases for that same setting so the new TOML value takes effect.
+aube reads configuration from `.npmrc` regardless of which tool wrote it.
+Writes follow a routing rule: settings marked `npmShared = true` in
+[`crates/aube-settings/settings.toml`][settings-toml] (plus per-host auth/cert
+templates and scoped registries) land in `.npmrc` so npm, yarn, and pnpm see
+the same value. Aube-only and pnpm-only settings land in
+`~/.config/aube/config.toml` instead, so unknown-to-npm keys don't trigger
+warnings from sibling tools.
+
+[settings-toml]: https://github.com/endevco/aube/blob/main/crates/aube-settings/settings.toml
 
 ## .npmrc
 
 ```ini
 registry=https://registry.npmjs.org/
-auto-install-peers=true
-strict-peer-dependencies=false
-node-linker=isolated
-package-import-method=auto
+@mycorp:registry=https://npm.mycorp.internal/
+//registry.npmjs.org/:_authToken=${NPM_TOKEN}
+https-proxy=http://corp-proxy:3128/
 ```
 
-Use `.npmrc` for registry, scoped registry, auth, and project-local
-pnpm-compatible settings. Registry auth still lives in `.npmrc` so npm and
-other package-manager tools can share the same credentials. aube preserves
-symlinked `.npmrc` files when it writes registry/auth keys.
+`.npmrc` holds the keys that npm, yarn, and pnpm all read: registries, scoped
+registries, per-host auth, proxy/TLS, and the npm-standard scalars tagged
+`npmShared` in the settings registry. aube preserves symlinked `.npmrc` files
+when it writes to one. See the [settings reference](/settings/) — each entry
+lists its `.npmrc` key alongside the other sources.
 
-See the [settings reference](/settings/) for the full list — each entry lists
-its `.npmrc` key alongside the other sources.
+Aube map settings (`allowBuilds`, `overrides`, `packageExtensions`, …) accept
+**dotted writes** at project scope to edit one entry at a time:
+
+```sh
+aube config set --local allowBuilds.@mongodb-js/zstd true
+aube config set --local overrides.lodash 4.17.21
+```
+
+The write lands in `pnpm-workspace.yaml#<map>.<entry>` when a workspace yaml
+exists, otherwise `package.json#aube.<map>.<entry>` — the same place install
+reads from. User-scope dotted writes for these maps error: aube only reads
+them per project. For `allowBuilds`, `aube approve-builds <pkg>` is the
+interactive equivalent.
 
 ## Workspace YAML
 
@@ -104,9 +119,11 @@ aube config set auto-install-peers false
 aube config list --json
 ```
 
-Known user/global aube settings are stored in user aube config. Unknown keys
-and registry/auth keys are stored in `.npmrc`; `--local` and
-`--location project` write project `.npmrc`.
+Writes land in `.npmrc` only for the npm-shared surface (auth, registries,
+npm-standard scalars). Everything else — aube settings, pnpm-only knobs, and
+unknown keys — is stored in aube's own config. `--local` and
+`--location project` write the project-scope equivalents (`<cwd>/.npmrc` and
+`<cwd>/.config/aube/config.toml`).
 
 ## `package.json` — `pnpm.*` and `aube.*` namespaces
 

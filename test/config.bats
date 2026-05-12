@@ -135,16 +135,16 @@ teardown() {
 	assert_failure
 }
 
-@test "config delete points at stale ~/.npmrc when an aube-known key lives only there" {
-	# Migration case: an older aube wrote aube-known keys to ~/.npmrc.
-	# After upgrading, `aube config delete <key>` should not silently
-	# touch ~/.npmrc (it's shared with npm/pnpm/yarn) — but the error
-	# must tell the user where the value actually is.
+@test "config delete points at .npmrc when an aube-only key lives only there" {
+	# `autoInstallPeers` is an aube-only setting (not npm-shared), so
+	# aube doesn't touch `.npmrc` for it — the file is shared with
+	# npm/pnpm/yarn. When the value only lives in `.npmrc`, delete
+	# surfaces the location so the user knows what to clean up.
 	echo "autoInstallPeers=false" >"$HOME/.npmrc"
 	run aube config delete autoInstallPeers
 	assert_failure
 	assert_output --partial ".npmrc"
-	assert_output --partial "stale entry"
+	assert_output --partial "an entry exists in"
 	# Confirm the .npmrc line is preserved.
 	run cat "$HOME/.npmrc"
 	assert_output --partial "autoInstallPeers=false"
@@ -432,6 +432,291 @@ EOF
 	# shellcheck disable=SC2016
 	assert_output '${AUBE_TEST_TOKEN}'
 	unset AUBE_TEST_TOKEN
+}
+
+@test "config set routes unknown keys to user config.toml, not .npmrc" {
+	# Discussion #617 follow-up: aube's `.npmrc` writes are scoped to the
+	# npm-shared surface (auth, registries, npm-standard scalars). Any
+	# other key — known aube setting or genuinely unknown — lands in
+	# aube's own config.toml so it doesn't pollute the file npm/yarn/pnpm
+	# also read.
+	run aube config set some-experimental-flag value
+	assert_success
+	assert [ -f "$XDG_CONFIG_HOME/aube/config.toml" ]
+	run cat "$XDG_CONFIG_HOME/aube/config.toml"
+	assert_output --partial 'some-experimental-flag = "value"'
+	if [ -e "$HOME/.npmrc" ]; then
+		run cat "$HOME/.npmrc"
+		refute_output --partial "some-experimental-flag"
+	fi
+}
+
+@test "config get reads free-form unknown keys back from config.toml" {
+	# Round-trip: an unknown key written via `config set` must be
+	# readable via `config get` without the user having to remember
+	# which file it ended up in.
+	run aube config set some-experimental-flag value
+	assert_success
+	run aube config get some-experimental-flag
+	assert_success
+	assert_output "value"
+}
+
+@test "config delete removes a free-form unknown key from config.toml" {
+	run aube config set some-experimental-flag value
+	assert_success
+	run aube config delete some-experimental-flag
+	assert_success
+	run aube config get some-experimental-flag
+	assert_success
+	assert_output "undefined"
+}
+
+@test "config set routes pnpm-only knobs (dangerouslyAllowAllBuilds) to config.toml" {
+	# `dangerouslyAllowAllBuilds` is a pnpm/aube-only knob. npm warns
+	# about it in `.npmrc`. With the inverted routing it lands in
+	# aube's own config alongside other aube-known settings.
+	run aube config set dangerouslyAllowAllBuilds true
+	assert_success
+	assert [ -f "$XDG_CONFIG_HOME/aube/config.toml" ]
+	run cat "$XDG_CONFIG_HOME/aube/config.toml"
+	assert_output --partial "dangerouslyAllowAllBuilds = true"
+	if [ -e "$HOME/.npmrc" ]; then
+		run cat "$HOME/.npmrc"
+		refute_output --partial "dangerouslyAllowAllBuilds"
+	fi
+}
+
+@test "config set rejects bare aube map settings" {
+	# Object-typed aube settings (`allowBuilds`, `overrides`,
+	# `packageExtensions`, …) can't be serialized as a single scalar
+	# via `config set`. The error must point at the right edit site.
+	run aube config set allowBuilds 'maybe'
+	assert_failure
+	assert_output --partial "allowBuilds"
+	assert_output --partial "map setting"
+}
+
+@test "config set keeps npm-shared keys in .npmrc" {
+	# `registry`, scoped registries, and per-host auth/cert tokens are
+	# part of the multi-tool npm contract and must keep landing in
+	# `.npmrc` so npm/pnpm/yarn read the same values.
+	run aube config set registry https://r.example.com/
+	assert_success
+	run aube config set @mycorp:registry https://npm.mycorp.internal/
+	assert_success
+	run aube config set "//r.example.com/:_authToken" secret
+	assert_success
+	run cat "$HOME/.npmrc"
+	assert_output --partial "registry=https://r.example.com/"
+	assert_output --partial "@mycorp:registry=https://npm.mycorp.internal/"
+	assert_output --partial "//r.example.com/:_authToken=secret"
+	# config.toml should not contain registry/auth keys
+	if [ -e "$XDG_CONFIG_HOME/aube/config.toml" ]; then
+		run cat "$XDG_CONFIG_HOME/aube/config.toml"
+		refute_output --partial "registry"
+		refute_output --partial "_authToken"
+	fi
+}
+
+@test "config delete sweeps .npmrc for npm-shared aube settings" {
+	# Settings like `engineStrict` are both npm-shared (so `set`
+	# routes them to .npmrc) and known aube settings in
+	# settings.toml. Delete must follow the same routing — otherwise
+	# the value sits stuck in .npmrc after `set` and `delete` fails
+	# with a misleading "stale entry" error.
+	run aube config set engineStrict false
+	assert_success
+	run cat "$HOME/.npmrc"
+	assert_output --partial "engineStrict=false"
+	# Delete must succeed and actually remove the .npmrc line.
+	run aube config delete engineStrict
+	assert_success
+	if [ -e "$HOME/.npmrc" ]; then
+		run cat "$HOME/.npmrc"
+		refute_output --partial "engineStrict"
+		refute_output --partial "engine-strict"
+	fi
+	run aube config get engineStrict
+	assert_success
+	assert_output "undefined"
+}
+
+@test "config set on an npm-shared aube setting sweeps stale config.toml" {
+	# Settings like `engineStrict` are in both the npm-shared allowlist
+	# (so writes land in `.npmrc` for cross-tool visibility) and
+	# settings.toml (so older aube versions may have written them to
+	# `config.toml` instead). The user-aube-config source outranks
+	# user `.npmrc` in the resolver, so a stale `config.toml` entry
+	# would silently shadow the new `.npmrc` value if we didn't sweep
+	# it on each write.
+	mkdir -p "$XDG_CONFIG_HOME/aube"
+	echo "engineStrict = true" >"$XDG_CONFIG_HOME/aube/config.toml"
+	run aube config set engineStrict false
+	assert_success
+	# .npmrc has the new value (preferred_write_key preserves the
+	# spelling the user typed when it's one of the known aliases).
+	run cat "$HOME/.npmrc"
+	assert_output --partial "engineStrict=false"
+	# config.toml stale entry must be gone
+	run cat "$XDG_CONFIG_HOME/aube/config.toml"
+	refute_output --partial "engineStrict"
+	refute_output --partial "engine-strict"
+	# Round-trip: get returns the new value, not the stale one.
+	run aube config get engineStrict
+	assert_success
+	assert_output "false"
+}
+
+@test "config set --local allowBuilds.<pkg> writes to project workspace yaml" {
+	# Discussion #617: `aube config set allowBuilds.<pkg> true` should
+	# be a valid input — at project scope it edits the same
+	# `allowBuilds:` map `aube approve-builds` mutates. With no
+	# workspace yaml present, the write lands in `package.json#aube.allowBuilds`
+	# via `aube-manifest::edit_setting_map`.
+	echo '{"name":"demo","version":"0.0.1"}' >package.json
+	run aube config set --local "allowBuilds.@mongodb-js/zstd" true
+	assert_success
+	run cat package.json
+	assert_output --partial '"allowBuilds"'
+	assert_output --partial '"@mongodb-js/zstd": true'
+	# .npmrc must stay clean.
+	if [ -e ".npmrc" ]; then
+		run cat .npmrc
+		refute_output --partial "allowBuilds"
+	fi
+}
+
+@test "config set --local allowBuilds.<pkg> appends to existing workspace yaml" {
+	# When a workspace yaml already exists, the dotted write extends
+	# its `allowBuilds:` map instead of touching `package.json`.
+	cat >pnpm-workspace.yaml <<-YAML
+		packages:
+		  - 'apps/*'
+		allowBuilds:
+		  sharp: true
+	YAML
+	run aube config set --local "allowBuilds.@mongodb-js/zstd" true
+	assert_success
+	run cat pnpm-workspace.yaml
+	assert_output --partial "sharp: true"
+	assert_output --partial "'@mongodb-js/zstd': true"
+}
+
+@test "config set --local overrides.<pkg> writes pure-digit versions as strings" {
+	# `overrides.express 4` is a valid version spec ("any 4.x"). It
+	# must serialize as a YAML *string*, not a YAML number — pnpm's
+	# (and aube's) typed-`String` deserializer rejects integer values
+	# without a custom visitor.
+	cat >pnpm-workspace.yaml <<-YAML
+		packages:
+		  - 'apps/*'
+	YAML
+	run aube config set --local overrides.express 4
+	assert_success
+	run cat pnpm-workspace.yaml
+	assert_output --partial "overrides:"
+	assert_output --partial "express: '4'"
+	refute_output --partial "express: 4
+"
+}
+
+@test "config set --local overrides.<pkg> writes to project workspace yaml" {
+	# Generic map-setting branch: dotted writes for any aube
+	# object-typed setting (`overrides`, `packageExtensions`, …) follow
+	# the same path as `allowBuilds`, without the approve-builds hint.
+	cat >pnpm-workspace.yaml <<-YAML
+		packages:
+		  - 'apps/*'
+	YAML
+	run aube config set --local overrides.lodash 4.17.21
+	assert_success
+	run cat pnpm-workspace.yaml
+	assert_output --partial "overrides:"
+	assert_output --partial "lodash: 4.17.21"
+}
+
+@test "config set allowBuilds.<pkg> at user scope errors with --local hint" {
+	# User-scope errors because aube only reads `allowBuilds` from the
+	# project's workspace yaml / `package.json` today. The hint points
+	# at `--local` rather than dropping the value where nothing reads
+	# it.
+	run aube config set "allowBuilds.@mongodb-js/zstd" true
+	assert_failure
+	assert_output --partial "allowBuilds"
+	assert_output --partial "--local"
+	# .npmrc must stay clean.
+	if [ -e "$HOME/.npmrc" ]; then
+		run cat "$HOME/.npmrc"
+		refute_output --partial "allowBuilds"
+	fi
+}
+
+@test "config set overrides.<pkg> at user scope errors with --local hint" {
+	# Same user-scope rejection as `allowBuilds` — generic map-setting
+	# branch, no per-setting special case.
+	run aube config set overrides.lodash 4.17.21
+	assert_failure
+	assert_output --partial "overrides"
+	assert_output --partial "--local"
+}
+
+@test "config delete --local allowBuilds.<pkg> round-trips with set" {
+	# Symmetric to `config set --local allowBuilds.<pkg>`: the set
+	# path writes to workspace yaml / `package.json#aube.allowBuilds`,
+	# so delete must sweep the same place. Without the dotted-delete
+	# path, the entry sits stuck after set and the CLI can't remove it.
+	echo '{"name":"demo","version":"0.0.1"}' >package.json
+	run aube config set --local "allowBuilds.@mongodb-js/zstd" true
+	assert_success
+	run aube config delete --local "allowBuilds.@mongodb-js/zstd"
+	assert_success
+	# allowBuilds map should be gone (empty submap is scrubbed).
+	run cat package.json
+	refute_output --partial "@mongodb-js/zstd"
+}
+
+@test "config delete --local allowBuilds.<pkg> sweeps existing workspace yaml" {
+	cat >pnpm-workspace.yaml <<-YAML
+		packages:
+		  - 'apps/*'
+		allowBuilds:
+		  sharp: true
+		  '@mongodb-js/zstd': true
+	YAML
+	run aube config delete --local "allowBuilds.@mongodb-js/zstd"
+	assert_success
+	run cat pnpm-workspace.yaml
+	# the other allowBuilds entry must survive
+	assert_output --partial "sharp: true"
+	# our target entry must be gone
+	refute_output --partial "@mongodb-js/zstd"
+}
+
+@test "config delete allowBuilds.<pkg> at user scope errors with --local hint" {
+	run aube config delete "allowBuilds.@mongodb-js/zstd"
+	assert_failure
+	assert_output --partial "allowBuilds"
+	assert_output --partial "--local"
+}
+
+@test "config delete --local overrides.<pkg> on missing entry errors cleanly" {
+	cat >pnpm-workspace.yaml <<-YAML
+		packages:
+		  - 'apps/*'
+	YAML
+	run aube config delete --local overrides.lodash
+	assert_failure
+	assert_output --partial "not set"
+}
+
+@test "config set autoInstallPeers.foo errors: scalar settings have no nested namespace" {
+	# Dotted writes against a *scalar* aube setting are still a
+	# syntactic error — there's no nested namespace to write into.
+	run aube config set autoInstallPeers.foo true
+	assert_failure
+	assert_output --partial "autoInstallPeers"
+	assert_output --partial "scalar"
 }
 
 @test "config accepts unknown (literal) keys for auth-style writes" {
