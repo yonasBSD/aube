@@ -1,14 +1,13 @@
 # Security
 
-aube treats supply-chain protection as a first-class concern. This page lists
-every security-relevant feature, its default, and the one-line config to turn
-it on or off.
+This page lists every security-relevant feature in aube, its default, and the
+one-line config to turn it on or off.
 
 To report a vulnerability, see the [security policy](https://github.com/endevco/aube/security/policy).
 
 ## The `paranoid` switch
 
-The fastest way to opt into the strict-security posture is one line:
+The fastest way to enable the strict bundle is one line:
 
 ```yaml
 paranoid: true
@@ -33,9 +32,10 @@ Use it when you want maximum protection without listing each setting.
 
 ## Default-deny lifecycle scripts
 
-Lifecycle scripts (`preinstall`, `install`, `postinstall`) are the sharpest
-supply-chain edge in a JavaScript install. aube does not run dependency
-lifecycle scripts unless you've approved them explicitly:
+Lifecycle scripts (`preinstall`, `install`, `postinstall`) run arbitrary code
+when a package is installed, which makes them a common attack vector. aube
+doesn't run dependency lifecycle scripts unless you've approved them
+explicitly:
 
 ```yaml
 # aube-workspace.yaml
@@ -50,8 +50,8 @@ Or interactively:
 aube approve-builds
 ```
 
-Root-package lifecycle scripts (your own project's) still run normally — the
-boundary is dependency code.
+Root-package lifecycle scripts (your own project's) still run normally; only
+dependency scripts need approval.
 
 Settings: [`allowBuilds`](/settings/#setting-allowbuilds). Install adds
 unreviewed build packages to `aube-workspace.yaml` (or `pnpm-workspace.yaml`
@@ -147,16 +147,15 @@ Settings: [`minimumReleaseAge`](/settings/#setting-minimumreleaseage),
 
 ## Typosquat and impersonation protection
 
-`aube add` checks every package on the command line before adding it to your
-manifest. Transitive deps and packages already in the lockfile are not
-re-checked — the gate is the moment of human intent, not every reinstall.
+`aube add` checks every package you name on the command line before adding
+it to your manifest. Transitive deps and packages already in the lockfile
+aren't re-checked.
 
 Two signals, with different response levels:
 
 **Known-malicious advisories.** aube batch-queries [OSV](https://osv.dev) for
 `MAL-*` advisories on every name about to be added. A hit fails the install
-with `ERR_AUBE_MALICIOUS_PACKAGE` and a link to the advisory. Confirmed
-malicious isn't a judgement call — this is a hard block, not a prompt. If
+with `ERR_AUBE_MALICIOUS_PACKAGE` and a link to the advisory. If
 the OSV API can't be reached, the default (`advisoryCheck: on`) warns and
 continues; `advisoryCheck: required` upgrades that to a fail-closed
 `ERR_AUBE_ADVISORY_CHECK_FAILED` so CI can tell a network outage from a
@@ -222,7 +221,7 @@ Settings: [`blockExoticSubdeps`](/settings/#setting-blockexoticsubdeps).
 
 Every registry tarball is verified against the SHA-512 hash recorded in the
 packument's `dist.integrity` field before it is added to the store. Mismatches
-fail the install loudly. The hash is preserved in the lockfile, so subsequent
+fail the install. The hash is preserved in the lockfile, so subsequent
 installs reverify on every fetch.
 
 The content-addressable store itself uses BLAKE3 for the on-disk index — fast
@@ -259,10 +258,9 @@ securityScanner: "@acme/bun-security-scanner"
 
 The scanner fires post-resolve, sees the full transitive graph
 with resolved versions, and **fails closed** on any scanner
-failure (missing `node`, unresolvable module, timeout, etc.) —
-a configured scanner that can't run is a refusal, not a free
-pass. Requires Node 22.6+. Set `securityScanner: ""` to disable
-when bootstrapping.
+failure (missing `node`, unresolvable module, timeout, etc.).
+Requires Node 22.6+. Set `securityScanner: ""` to disable when
+bootstrapping.
 
 Full reference: [Security scanner](/package-manager/security-scanner).
 
