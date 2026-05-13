@@ -22,6 +22,7 @@ Aube generates this page from [`settings.toml`](https://github.com/endevco/aube/
 | [`minimumReleaseAge`](#setting-minimumreleaseage) | `int` | Delay installation of newly published versions (minutes). |
 | [`minimumReleaseAgeExclude`](#setting-minimumreleaseageexclude) | `list<string>` | Packages exempt from the minimumReleaseAge requirement. |
 | [`minimumReleaseAgeStrict`](#setting-minimumreleaseagestrict) | `bool` | Fail the install when no version satisfies the minimumReleaseAge cutoff. |
+| [`securityScanner`](#setting-securityscanner) | `string` | Bun-compatible security scanner module. |
 | [`advisoryCheck`](#setting-advisorycheck) | `"on" \| "required" \| "off"` | OSV `MAL-*` advisory check on `aube add`. |
 | [`lowDownloadThreshold`](#setting-lowdownloadthreshold) | `int` | Weekly-download floor for `aube add` (typosquat prompt). |
 | [`paranoid`](#setting-paranoid) | `bool` | Turn on the strict-security setting bundle in one switch. |
@@ -335,6 +336,33 @@ Fail the install when no version satisfies the minimumReleaseAge cutoff.
 By default the resolver falls back to the lowest satisfying version when
 every candidate is younger than `minimumReleaseAge`. With this set, the
 resolver fails the install instead.
+
+### `securityScanner` {#setting-securityscanner}
+
+Bun-compatible security scanner module.
+
+- Type: `string`
+- Default: `""`
+- Environment: `npm_config_security_scanner`, `NPM_CONFIG_SECURITY_SCANNER`, `AUBE_SECURITY_SCANNER`
+- .npmrc keys: `securityScanner`, `security-scanner`
+- Workspace YAML keys: `securityScanner`
+
+Path (or bare npm package name) of a
+[Bun-compatible security scanner](https://bun.sh/docs/pm/security-scanner-api)
+module. Aube loads it through a `node` bridge that adapts Bun's
+in-process plugin contract to a subprocess.
+
+```yaml
+# aube-workspace.yaml
+securityScanner: "@acme/bun-security-scanner"
+```
+
+Empty string (the default) disables the integration. Requires
+Node 22.6+. Fails closed on any scanner failure.
+
+Full reference, including the Bun-runtime API surface aube shims,
+authoring instructions, and the post-resolve firing model:
+[/package-manager/security-scanner](/package-manager/security-scanner).
 
 ### `advisoryCheck` {#setting-advisorycheck}
 

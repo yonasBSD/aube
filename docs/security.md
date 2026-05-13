@@ -229,6 +229,30 @@ Inside jailed lifecycle scripts, common token env vars (`NPM_TOKEN`,
 scrubbed from the script environment unless explicitly granted via
 `jailBuildPermissions`.
 
+## Pluggable security scanner
+
+`securityScanner` runs a [Bun-compatible security scanner](https://bun.sh/docs/pm/security-scanner-api)
+against the resolved install graph. Point the setting at the same
+npm package you'd put in Bun's `bunfig.toml#install.security.scanner`
+and aube loads it through a `node` bridge — the
+[oven-sh template](https://github.com/oven-sh/security-scanner-template)
+and [`@socketsecurity/bun-security-scanner`](https://github.com/SocketDev/bun-security-scanner)
+both run unchanged.
+
+```yaml
+# aube-workspace.yaml
+securityScanner: "@acme/bun-security-scanner"
+```
+
+The scanner fires post-resolve, sees the full transitive graph
+with resolved versions, and **fails closed** on any scanner
+failure (missing `node`, unresolvable module, timeout, etc.) —
+a configured scanner that can't run is a refusal, not a free
+pass. Requires Node 22.6+. Set `securityScanner: ""` to disable
+when bootstrapping.
+
+Full reference: [Security scanner](/package-manager/security-scanner).
+
 ## Auditing installed dependencies
 
 ```sh

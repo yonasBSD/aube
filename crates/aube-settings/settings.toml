@@ -264,6 +264,35 @@ sources.workspaceYaml = ["minimumReleaseAgeStrict"]
 precedence = ["workspaceYaml", "npmrc"]
 examples = []
 
+[securityScanner]
+description = "Bun-compatible security scanner module."
+type = "string"
+default = "\"\""
+docs = """
+Path (or bare npm package name) of a
+[Bun-compatible security scanner](https://bun.sh/docs/pm/security-scanner-api)
+module. Aube loads it through a `node` bridge that adapts Bun's
+in-process plugin contract to a subprocess.
+
+```yaml
+# aube-workspace.yaml
+securityScanner: \"@acme/bun-security-scanner\"
+```
+
+Empty string (the default) disables the integration. Requires
+Node 22.6+. Fails closed on any scanner failure.
+
+Full reference, including the Bun-runtime API surface aube shims,
+authoring instructions, and the post-resolve firing model:
+[/package-manager/security-scanner](/package-manager/security-scanner).
+"""
+sources.cli = []
+sources.env = ["npm_config_security_scanner", "NPM_CONFIG_SECURITY_SCANNER", "AUBE_SECURITY_SCANNER"]
+sources.npmrc = ["securityScanner"]
+sources.workspaceYaml = ["securityScanner"]
+precedence = ["workspaceYaml", "npmrc"]
+examples = []
+
 [advisoryCheck]
 description = "OSV `MAL-*` advisory check on `aube add`."
 type = '"on" | "required" | "off"'

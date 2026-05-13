@@ -451,6 +451,12 @@ pub struct WorkspaceConfig {
     #[serde(default)]
     pub low_download_threshold: Option<u64>,
 
+    /// Bun-compatible security scanner module spec (npm package name
+    /// or path) loaded via a `node` bridge at install / add time.
+    /// Empty string disables the integration.
+    #[serde(default)]
+    pub security_scanner: Option<String>,
+
     /// pnpm-style peer dependency escape hatches. Read by
     /// `PeerDependencyRules::resolve` during install; the actual matching
     /// logic lives in `aube`. We only need the container here so the

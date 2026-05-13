@@ -3998,6 +3998,22 @@ pub async fn run(opts: InstallOptions) -> miette::Result<()> {
             // chain back to the importer.
             crate::dep_chain::set_active(&graph);
             aube_registry::slow_metadata::flush_summary();
+
+            // Bun-compatible security scanner runs against the
+            // *resolved* graph — full transitive set with concrete
+            // versions, matching Bun's contract. Fires before fetch
+            // so a `fatal` advisory aborts without wasting bandwidth
+            // on tarball downloads. Fail-closed on any subprocess
+            // failure (see `commands::security_scanner`); empty
+            // `securityScanner` (the default) short-circuits to a
+            // no-op without spawning `node`.
+            let scanner = super::with_settings_ctx(&cwd, aube_settings::resolved::security_scanner);
+            if !scanner.is_empty() {
+                let scanner_packages =
+                    super::security_scanner::resolved_packages_for_scanner(&graph);
+                super::security_scanner::run_scanner(&scanner, &cwd, &scanner_packages).await?;
+            }
+
             if let Some(p) = prog_ref {
                 p.set_phase("fetching");
             }

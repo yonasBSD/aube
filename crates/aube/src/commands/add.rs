@@ -819,12 +819,14 @@ pub async fn run(
         apply_allow_build_flags(&cwd, &allow_build)?;
     }
 
-    // Supply-chain gates (OSV malicious-package advisories + weekly
-    // downloads floor) run *before* manifest mutation so a refusal
-    // leaves `package.json` untouched. Restricted to registry-bound
-    // names — git, local, workspace, and aliased specs all skip both
-    // checks because the public-registry signal doesn't apply. The
-    // call is no-op when the filtered list is empty.
+    // OSV / downloads gates fire pre-manifest-mutation — they're
+    // human-intent signals that key off the typed package names,
+    // so a refusal here leaves `package.json` untouched. The
+    // Bun-style `securityScanner` is intentionally NOT called
+    // here: it runs post-resolve from `install::run` against the
+    // full resolved graph (matching Bun's contract), with
+    // concrete versions + transitives the OSV/downloads probes
+    // wouldn't see at this stage.
     let registry_names = registry_bound_names_for_supply_chain(&cwd, packages);
     let (advisory_check, low_download_threshold) = super::with_settings_ctx(&cwd, |ctx| {
         let policy = if aube_settings::resolved::paranoid(ctx) {
@@ -1862,24 +1864,6 @@ fn apply_allow_build_flags(cwd: &std::path::Path, names: &[String]) -> miette::R
     Ok(())
 }
 
-/// Filter the user-supplied package strings down to the names that
-/// will resolve via the public npm registry, so the supply-chain
-/// gates (`add_supply_chain::run_gates`) skip everything else.
-///
-/// Excluded: git/local/workspace/jsr specs — none of these route
-/// through a public-registry name where an OSV `MAL-*` advisory
-/// or a downloads count would apply.
-///
-/// **Aliased specs are included** on their real registry name
-/// (`my-alias@npm:real-pkg` checks `real-pkg`). Skipping these on
-/// the "user typed it on purpose" theory would let
-/// `my-alias@npm:malicious-pkg` walk past a hard block that's
-/// explicitly described as "not a judgement call."
-///
-/// **Scoped names** (`@scope/name`) are also included: OSV's
-/// batch API supports scoped queries, and the downloads probe
-/// naturally folds them into `DownloadCount::Unknown` so the
-/// prompt skips them without a per-name special case here.
 fn registry_bound_names_for_supply_chain(cwd: &Path, packages: &[String]) -> Vec<String> {
     let mut names = Vec::with_capacity(packages.len());
     let workspace_versions = collect_workspace_versions(cwd);
@@ -1964,9 +1948,11 @@ async fn run_filtered(
         apply_allow_build_flags(&root, &args.allow_build)?;
     }
 
-    // Supply-chain gates fire once against the workspace root —
-    // applies to every filter-matched importer because they all share
-    // the same set of `packages` strings.
+    // OSV / downloads gates fire once against the workspace root
+    // — every filter-matched importer shares the same
+    // `args.packages` list. The Bun-style `securityScanner` is
+    // NOT called here: it runs post-resolve from `install::run`
+    // against the full resolved graph.
     let registry_names = registry_bound_names_for_supply_chain(&root, &args.packages);
     let (advisory_check, low_download_threshold) = super::with_settings_ctx(&root, |ctx| {
         let policy = if aube_settings::resolved::paranoid(ctx) {

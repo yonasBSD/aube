@@ -91,6 +91,7 @@ pub const WARN_AUBE_WORKSPACE_TOPO_CYCLE: &str = "WARN_AUBE_WORKSPACE_TOPO_CYCLE
 // ── supply chain (add-time) ─────────────────────────────────────────
 pub const WARN_AUBE_LOW_DOWNLOAD_PACKAGE: &str = "WARN_AUBE_LOW_DOWNLOAD_PACKAGE";
 pub const WARN_AUBE_ADVISORY_CHECK_FAILED: &str = "WARN_AUBE_ADVISORY_CHECK_FAILED";
+pub const WARN_AUBE_SECURITY_SCANNER_FINDING: &str = "WARN_AUBE_SECURITY_SCANNER_FINDING";
 
 /// Stable category labels that group codes in the generated docs.
 /// Public so the docs generator can iterate them deterministically.
@@ -463,6 +464,12 @@ pub const ALL: &[CodeMeta] = &[
         name: WARN_AUBE_ADVISORY_CHECK_FAILED,
         category: category::SUPPLY_CHAIN,
         description: "OSV `MAL-*` advisory check couldn't reach the API. With `advisoryCheck=on` (default) install continues; with `advisoryCheck=required` install fails closed.",
+        exit_code: None,
+    },
+    CodeMeta {
+        name: WARN_AUBE_SECURITY_SCANNER_FINDING,
+        category: category::SUPPLY_CHAIN,
+        description: "User-configured `securityScanner` returned a `warn`-level advisory. Install continues — only `fatal`-level advisories block.",
         exit_code: None,
     },
 ];

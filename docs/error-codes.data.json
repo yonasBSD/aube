@@ -169,6 +169,18 @@
       "exit_code": 49
     },
     {
+      "name": "ERR_AUBE_SECURITY_SCANNER_FATAL",
+      "category": "Supply chain (add-time)",
+      "description": "User-configured `securityScanner` returned a `fatal`-level advisory against a package the user is trying to add. Bun-style pluggable scanner contract; the scanner itself decides what counts as fatal.",
+      "exit_code": 48
+    },
+    {
+      "name": "ERR_AUBE_SECURITY_SCANNER_FAILED",
+      "category": "Supply chain (add-time)",
+      "description": "User-configured `securityScanner` couldn't be spawned, exited non-zero, timed out, or emitted unparseable JSON. Fail-closed by design: a configured scanner that can't run is treated as a refusal, not a free pass. Set `securityScanner = \"\"` to disable the integration when bootstrapping or recovering from a broken scanner.",
+      "exit_code": null
+    },
+    {
       "name": "ERR_AUBE_SCRIPT_NON_ZERO_EXIT",
       "category": "Scripts / build",
       "description": "A lifecycle script (`preinstall` / `install` / `postinstall` / a `package.json` script) exited non-zero.",
@@ -655,6 +667,12 @@
       "category": "Supply chain (add-time)",
       "description": "OSV `MAL-*` advisory check couldn't reach the API. With `advisoryCheck=on` (default) install continues; with `advisoryCheck=required` install fails closed.",
       "exit_code": null
+    },
+    {
+      "name": "WARN_AUBE_SECURITY_SCANNER_FINDING",
+      "category": "Supply chain (add-time)",
+      "description": "User-configured `securityScanner` returned a `warn`-level advisory. Install continues — only `fatal`-level advisories block.",
+      "exit_code": null
     }
   ],
   "categories": {
@@ -663,6 +681,7 @@
       "Resolver",
       "Tarball / store",
       "Registry / network",
+      "Supply chain (add-time)",
       "Scripts / build",
       "Linker",
       "Manifest / workspace",
