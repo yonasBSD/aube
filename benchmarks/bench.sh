@@ -393,12 +393,45 @@ expand_template() {
 	echo "$tpl"
 }
 
+# Minimum publish-age gate, in minutes. aube defaults to 1440 (24h)
+# as a supply-chain mitigation — the resolver skips versions newer
+# than this window. The default forces aube to fetch the full
+# (non-corgi) packument format so it can read the per-version `time`
+# map; corgi omits `time` on npmjs.org. Most modern PMs support an
+# equivalent flag, each with their own unit:
+#
+#   aube  minimumReleaseAge          (minutes; default 1440)
+#   npm   --min-release-age          (days)
+#   pnpm  --config.minimum-release-age (minutes)
+#   bun   --minimum-release-age      (seconds)
+#   deno  --minimum-dependency-age   (minutes, marked Unstable)
+#   yarn  not supported
+#   vlt   not investigated (currently disabled in BENCH_TOOLS anyway)
+#
+# Pinning all supported PMs to the same value makes the bench an
+# apples-to-apples comparison — otherwise aube alone pays the
+# full-packument cost (5x larger response on @types/node and similar
+# heavily-versioned packuments) while bun/pnpm cruise on corgi.
+#
+# Override via `BENCH_MIN_RELEASE_AGE_MINUTES=0` to disable the gate
+# across all PMs (useful for measuring raw resolver speed without
+# the security-feature axis).
+MIN_RELEASE_AGE_MINUTES="${BENCH_MIN_RELEASE_AGE_MINUTES:-1440}"
+MIN_RELEASE_AGE_SECONDS=$((MIN_RELEASE_AGE_MINUTES * 60))
+# npm uses days as the unit. Round up so the gate is at least as
+# strict as aube's, never weaker. (60*24 = 1440 → 1 day exactly.)
+MIN_RELEASE_AGE_DAYS=$(((MIN_RELEASE_AGE_MINUTES + 60 * 24 - 1) / (60 * 24)))
+
 # Per-tool boilerplate factored out of the `CMDS` declarations below.
 # Every bun invocation threads the same hermetic environment
 # (isolated `HOME`, `BUN_INSTALL`, `--cache-dir`, `--ignore-scripts`,
 # `--no-summary`) so the scenarios only have to spell out the
 # install-mode flags that actually vary per scenario.
-BUN_BASE="HOME={home} BUN_INSTALL={home}/.bun {bin} install --cache-dir {cache} --ignore-scripts --no-summary"
+#
+# `--minimum-release-age` is bun's name for the same supply-chain
+# gate aube defaults on; matching the value here keeps the bench
+# from advantaging bun by silently skipping work aube does.
+BUN_BASE="HOME={home} BUN_INSTALL={home}/.bun {bin} install --cache-dir {cache} --ignore-scripts --no-summary --minimum-release-age=${MIN_RELEASE_AGE_SECONDS}"
 
 # aube reads the global store root from `$XDG_DATA_HOME/aube/store`
 # (falling back to `$HOME/.local/share/aube/store`). We must pin
@@ -406,7 +439,13 @@ BUN_BASE="HOME={home} BUN_INSTALL={home}/.bun {bin} install --cache-dir {cache} 
 # a host that already has `XDG_DATA_HOME` set in its environment
 # would leak the benchmark's store out of the isolated `{home}`,
 # and `COLD_WIPE` wouldn't find it to clean up between iterations.
-AUBE_ENV="HOME={home} XDG_CACHE_HOME={cache} XDG_DATA_HOME={home}/.local/share"
+# `npm_config_minimum_release_age` propagates the bench's
+# minimum-release-age value into aube (aube reads this env var via
+# its npm-compatible settings layer). Without it, aube uses its
+# compiled-in default (1440) regardless of
+# `BENCH_MIN_RELEASE_AGE_MINUTES`, silently breaking the
+# apples-to-apples guarantee for any non-default override.
+AUBE_ENV="HOME={home} XDG_CACHE_HOME={cache} XDG_DATA_HOME={home}/.local/share npm_config_minimum_release_age=${MIN_RELEASE_AGE_MINUTES}"
 
 # Per-scenario AUBE_ENV variants that pin aube's global virtual store mode
 # via the `enableGlobalVirtualStore` setting's auto-synthesized env-var
@@ -435,10 +474,10 @@ cmd_template() {
 		echo "cd {project} && $BUN_BASE --frozen-lockfile >/dev/null 2>&1"
 		;;
 	gvs-warm:npm | ci-warm:npm)
-		echo "cd {project} && HOME={home} npm_config_cache={cache} {bin} ci --ignore-scripts --no-audit --no-fund --legacy-peer-deps --prefer-offline >/dev/null 2>&1"
+		echo "cd {project} && HOME={home} npm_config_cache={cache} {bin} ci --ignore-scripts --no-audit --no-fund --legacy-peer-deps --prefer-offline --min-release-age=${MIN_RELEASE_AGE_DAYS} >/dev/null 2>&1"
 		;;
 	gvs-warm:pnpm | gvs-cold:pnpm | ci-warm:pnpm | ci-cold:pnpm)
-		echo "cd {project} && HOME={home} {bin} install --frozen-lockfile --ignore-scripts >/dev/null 2>&1"
+		echo "cd {project} && HOME={home} {bin} install --frozen-lockfile --ignore-scripts --config.minimum-release-age=${MIN_RELEASE_AGE_MINUTES} >/dev/null 2>&1"
 		;;
 	gvs-warm:yarn | gvs-cold:yarn | ci-warm:yarn | ci-cold:yarn)
 		# Yarn 4: --immutable replaces --frozen-lockfile and aborts
@@ -450,7 +489,9 @@ cmd_template() {
 		# Deno 2: --frozen errors out if the lockfile would change,
 		# the equivalent of --frozen-lockfile elsewhere. Lifecycle
 		# scripts are off unless --allow-scripts is passed.
-		echo "cd {project} && HOME={home} DENO_DIR={cache} {bin} install --frozen --quiet >/dev/null 2>&1"
+		# `--minimum-dependency-age` is flagged "Unstable" in deno's
+		# help but the flag itself parses fine; takes minutes.
+		echo "cd {project} && HOME={home} DENO_DIR={cache} {bin} install --frozen --quiet --minimum-dependency-age=${MIN_RELEASE_AGE_MINUTES} >/dev/null 2>&1"
 		;;
 	gvs-warm:vlt | gvs-cold:vlt | ci-warm:vlt | ci-cold:vlt)
 		# vlt's --frozen-lockfile mirrors pnpm/npm/aube semantics: refuse
@@ -460,7 +501,7 @@ cmd_template() {
 		echo "cd {project} && HOME={home} npm_config_cache={cache} {bin} install --frozen-lockfile >/dev/null 2>&1"
 		;;
 	gvs-cold:npm | ci-cold:npm)
-		echo "cd {project} && HOME={home} npm_config_cache={cache} {bin} ci --ignore-scripts --no-audit --no-fund --legacy-peer-deps >/dev/null 2>&1"
+		echo "cd {project} && HOME={home} npm_config_cache={cache} {bin} ci --ignore-scripts --no-audit --no-fund --legacy-peer-deps --min-release-age=${MIN_RELEASE_AGE_DAYS} >/dev/null 2>&1"
 		;;
 	ci-warm:aube | ci-cold:aube)
 		echo "cd {project} && $AUBE_ENV_GVS_OFF {bin} install --frozen-lockfile >/dev/null 2>&1"
@@ -472,16 +513,16 @@ cmd_template() {
 		echo "cd {project} && $BUN_BASE --frozen-lockfile >/dev/null 2>&1 && HOME={home} BUN_INSTALL={home}/.bun {bin} run test >/dev/null 2>&1"
 		;;
 	install-test:npm)
-		echo "cd {project} && HOME={home} npm_config_cache={cache} {bin} install-test --ignore-scripts --no-audit --no-fund --legacy-peer-deps --prefer-offline >/dev/null 2>&1"
+		echo "cd {project} && HOME={home} npm_config_cache={cache} {bin} install-test --ignore-scripts --no-audit --no-fund --legacy-peer-deps --prefer-offline --min-release-age=${MIN_RELEASE_AGE_DAYS} >/dev/null 2>&1"
 		;;
 	install-test:pnpm)
-		echo "cd {project} && HOME={home} {bin} install-test --frozen-lockfile --ignore-scripts >/dev/null 2>&1"
+		echo "cd {project} && HOME={home} {bin} install-test --frozen-lockfile --ignore-scripts --config.minimum-release-age=${MIN_RELEASE_AGE_MINUTES} >/dev/null 2>&1"
 		;;
 	install-test:yarn)
 		echo "cd {project} && HOME={home} {bin} install --immutable >/dev/null 2>&1 && HOME={home} {bin} test >/dev/null 2>&1"
 		;;
 	install-test:deno)
-		echo "cd {project} && HOME={home} DENO_DIR={cache} {bin} install --frozen --quiet >/dev/null 2>&1 && HOME={home} DENO_DIR={cache} {bin} task --quiet test >/dev/null 2>&1"
+		echo "cd {project} && HOME={home} DENO_DIR={cache} {bin} install --frozen --quiet --minimum-dependency-age=${MIN_RELEASE_AGE_MINUTES} >/dev/null 2>&1 && HOME={home} DENO_DIR={cache} {bin} task --quiet test >/dev/null 2>&1"
 		;;
 	install-test:vlt)
 		echo "cd {project} && HOME={home} npm_config_cache={cache} {bin} install --frozen-lockfile >/dev/null 2>&1 && HOME={home} npm_config_cache={cache} {bin} run test >/dev/null 2>&1"
@@ -490,19 +531,22 @@ cmd_template() {
 		echo "cd {project} && $AUBE_ENV_GVS_ON {bin} add is-odd >/dev/null 2>&1"
 		;;
 	add:bun)
-		echo "cd {project} && HOME={home} BUN_INSTALL={home}/.bun {bin} add is-odd --cache-dir {cache} --ignore-scripts --no-summary >/dev/null 2>&1"
+		# Can't reuse $BUN_BASE: that template hardcodes `install`,
+		# this scenario needs `add`. Flag list below is intentionally
+		# kept in sync with BUN_BASE — update both together.
+		echo "cd {project} && HOME={home} BUN_INSTALL={home}/.bun {bin} add is-odd --cache-dir {cache} --ignore-scripts --no-summary --minimum-release-age=${MIN_RELEASE_AGE_SECONDS} >/dev/null 2>&1"
 		;;
 	add:npm)
-		echo "cd {project} && HOME={home} npm_config_cache={cache} {bin} install --ignore-scripts --no-audit --no-fund --legacy-peer-deps is-odd >/dev/null 2>&1"
+		echo "cd {project} && HOME={home} npm_config_cache={cache} {bin} install --ignore-scripts --no-audit --no-fund --legacy-peer-deps --min-release-age=${MIN_RELEASE_AGE_DAYS} is-odd >/dev/null 2>&1"
 		;;
 	add:pnpm)
-		echo "cd {project} && HOME={home} {bin} add is-odd --ignore-scripts >/dev/null 2>&1"
+		echo "cd {project} && HOME={home} {bin} add is-odd --ignore-scripts --config.minimum-release-age=${MIN_RELEASE_AGE_MINUTES} >/dev/null 2>&1"
 		;;
 	add:yarn)
 		echo "cd {project} && HOME={home} {bin} add is-odd >/dev/null 2>&1"
 		;;
 	add:deno)
-		echo "cd {project} && HOME={home} DENO_DIR={cache} {bin} add --quiet npm:is-odd >/dev/null 2>&1"
+		echo "cd {project} && HOME={home} DENO_DIR={cache} {bin} add --quiet --minimum-dependency-age=${MIN_RELEASE_AGE_MINUTES} npm:is-odd >/dev/null 2>&1"
 		;;
 	add:vlt)
 		echo "cd {project} && HOME={home} npm_config_cache={cache} {bin} install is-odd >/dev/null 2>&1"
