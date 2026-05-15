@@ -194,6 +194,10 @@ EOF
 	run aube install
 	assert_success
 
+	run node -e "try { require('is-odd')('nope') } catch (e) { console.log(e.message) }"
+	assert_success
+	assert_output "expected a numeric value"
+
 	run cmp -s bun.lock bun.lock.before
 	assert_success
 }

@@ -2,9 +2,10 @@
 //! commands and the install-time patch application path.
 //!
 //! Patches are stored alongside the project (default `patches/`) and
-//! tracked in `package.json` under `pnpm.patchedDependencies` —
-//! `{ "name@version": "patches/name@version.patch" }`. We mirror pnpm's
-//! shape exactly so the field round-trips between the two tools.
+//! tracked as `{ "name@version": "patches/name@version.patch" }`.
+//! Sources are merged from Bun's top-level `patchedDependencies`,
+//! `pnpm.patchedDependencies` / `aube.patchedDependencies`, then
+//! workspace-yaml `patchedDependencies`, in that precedence order.
 
 use miette::{Context, IntoDiagnostic, Result, miette};
 use sha2::{Digest, Sha256};
@@ -150,6 +151,7 @@ pub fn load_patches(cwd: &Path) -> Result<BTreeMap<String, ResolvedPatch>> {
         let manifest = aube_manifest::PackageJson::from_path(&manifest_path)
             .map_err(miette::Report::new)
             .wrap_err("failed to read package.json")?;
+        entries.extend(manifest.bun_patched_dependencies());
         entries.extend(manifest.pnpm_patched_dependencies());
     }
 
@@ -228,7 +230,9 @@ pub fn upsert_patched_dependency(cwd: &Path, key: &str, rel_patch_path: &str) ->
 }
 
 /// Drop an entry from `patchedDependencies` in whichever file declares
-/// it (workspace yaml, `package.json#pnpm.patchedDependencies`,
+/// it (workspace yaml, Bun's top-level
+/// `package.json#patchedDependencies`,
+/// `package.json#pnpm.patchedDependencies`,
 /// `package.json#aube.patchedDependencies`, or any combination).
 /// Returns the files that were rewritten — empty when no location held
 /// the entry. Each side peeks before rewriting so the no-op case
@@ -242,13 +246,61 @@ pub fn remove_patched_dependency(cwd: &Path, key: &str) -> Result<Vec<PathBuf>> 
     {
         rewritten.push(ws_path);
     }
-    if aube_manifest::workspace::remove_setting_entry(cwd, "patchedDependencies", key)
-        .map_err(miette::Report::new)
-        .wrap_err("failed to write package.json")?
-    {
+    let removed_namespaced =
+        aube_manifest::workspace::remove_setting_entry(cwd, "patchedDependencies", key)
+            .map_err(miette::Report::new)
+            .wrap_err("failed to write package.json")?;
+    let removed_bun =
+        remove_bun_patched_dependency(cwd, key).wrap_err("failed to write package.json")?;
+    if removed_namespaced || removed_bun {
         rewritten.push(cwd.join("package.json"));
     }
     Ok(rewritten)
+}
+
+fn remove_bun_patched_dependency(cwd: &Path, key: &str) -> Result<bool> {
+    let path = cwd.join("package.json");
+    if !path.exists() {
+        return Ok(false);
+    }
+    let raw = std::fs::read_to_string(&path)
+        .into_diagnostic()
+        .map_err(|e| miette!("failed to read {}: {e}", path.display()))?;
+    let mut value =
+        aube_manifest::parse_json::<serde_json::Value>(&path, raw).map_err(miette::Report::new)?;
+    let obj = value
+        .as_object_mut()
+        .ok_or_else(|| miette!("package.json is not an object"))?;
+    let before = obj.clone();
+
+    let mut remove_empty_map = false;
+    let removed = if let Some(patched) = obj
+        .get_mut("patchedDependencies")
+        .and_then(serde_json::Value::as_object_mut)
+    {
+        let removed = patched.remove(key).is_some();
+        if removed {
+            remove_empty_map = patched.is_empty();
+        }
+        removed
+    } else {
+        false
+    };
+    if remove_empty_map {
+        obj.remove("patchedDependencies");
+    }
+    if *obj == before {
+        return Ok(removed);
+    }
+
+    let mut out = serde_json::to_string_pretty(&value)
+        .into_diagnostic()
+        .map_err(|e| miette!("failed to serialize {}: {e}", path.display()))?;
+    out.push('\n');
+    std::fs::write(&path, out)
+        .into_diagnostic()
+        .map_err(|e| miette!("failed to write {}: {e}", path.display()))?;
+    Ok(removed)
 }
 
 /// Read every declared `patchedDependencies` entry across both the
@@ -271,7 +323,9 @@ fn read_package_json_patched_dependencies(cwd: &Path) -> Result<BTreeMap<String,
     let manifest = aube_manifest::PackageJson::from_path(&manifest_path)
         .map_err(miette::Report::new)
         .wrap_err("failed to read package.json")?;
-    Ok(manifest.pnpm_patched_dependencies())
+    let mut out = manifest.bun_patched_dependencies();
+    out.extend(manifest.pnpm_patched_dependencies());
+    Ok(out)
 }
 
 /// Recursively copy `src` into `dst`, following file content but
@@ -377,6 +431,35 @@ mod tests {
     }
 
     #[test]
+    fn load_reads_bun_top_level_patched_dependencies() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("patches")).unwrap();
+        std::fs::write(
+            dir.path().join("package.json"),
+            r#"{
+  "patchedDependencies": {
+    "is-number@7.0.0": "patches/is-number.patch"
+  }
+}
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("patches/is-number.patch"),
+            "diff --git a/index.js b/index.js\n",
+        )
+        .unwrap();
+
+        let patches = load_patches(dir.path()).unwrap();
+        assert_eq!(
+            patches
+                .get("is-number@7.0.0")
+                .map(|p| p.path.strip_prefix(dir.path()).unwrap()),
+            Some(Path::new("patches/is-number.patch"))
+        );
+    }
+
+    #[test]
     fn upsert_collapses_shadow_when_other_namespace_holds_stale_entry() {
         // A pnpm-aware tool can add a `pnpm` namespace after aube has
         // already populated `aube.patchedDependencies`. Without the
@@ -426,6 +509,88 @@ mod tests {
         // The patch entry must be inside pnpm.
         let parsed: serde_json::Value = serde_json::from_str(&manifest).unwrap();
         assert!(parsed["pnpm"]["patchedDependencies"]["a@1.0.0"].is_string());
+    }
+
+    #[test]
+    fn remove_deletes_bun_top_level_patched_dependency() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("package.json"),
+            r#"{
+  "patchedDependencies": {
+    "a@1.0.0": "patches/a.patch",
+    "b@2.0.0": "patches/b.patch"
+  }
+}
+"#,
+        )
+        .unwrap();
+
+        let rewritten = remove_patched_dependency(dir.path(), "a@1.0.0").unwrap();
+        assert_eq!(rewritten, vec![dir.path().join("package.json")]);
+        let parsed: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(dir.path().join("package.json")).unwrap(),
+        )
+        .unwrap();
+        assert!(parsed["patchedDependencies"]["a@1.0.0"].is_null());
+        assert_eq!(parsed["patchedDependencies"]["b@2.0.0"], "patches/b.patch");
+    }
+
+    #[test]
+    fn remove_drops_empty_bun_top_level_patched_dependencies() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("package.json"),
+            r#"{
+  "patchedDependencies": {
+    "a@1.0.0": "patches/a.patch"
+  }
+}
+"#,
+        )
+        .unwrap();
+
+        remove_patched_dependency(dir.path(), "a@1.0.0").unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(dir.path().join("package.json")).unwrap(),
+        )
+        .unwrap();
+        assert!(parsed["patchedDependencies"].is_null());
+    }
+
+    #[test]
+    fn remove_leaves_empty_bun_top_level_map_when_key_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("package.json"),
+            "{\n  \"patchedDependencies\": {}\n}\n",
+        )
+        .unwrap();
+
+        let rewritten = remove_patched_dependency(dir.path(), "missing@9.9.9").unwrap();
+        assert!(rewritten.is_empty());
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("package.json")).unwrap(),
+            "{\n  \"patchedDependencies\": {}\n}\n"
+        );
+    }
+
+    #[test]
+    fn remove_reads_bom_prefixed_package_json() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("package.json"),
+            "\u{feff}{\n  \"patchedDependencies\": {\n    \"a@1.0.0\": \"patches/a.patch\"\n  }\n}\n",
+        )
+        .unwrap();
+
+        let rewritten = remove_patched_dependency(dir.path(), "a@1.0.0").unwrap();
+        assert_eq!(rewritten, vec![dir.path().join("package.json")]);
+        let parsed: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(dir.path().join("package.json")).unwrap(),
+        )
+        .unwrap();
+        assert!(parsed["patchedDependencies"].is_null());
     }
 
     #[test]
